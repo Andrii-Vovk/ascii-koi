@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ascii branch</title>
+<title>ascii winter branch</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #06070c; overflow: hidden; }
+  html, body { margin: 0; height: 100%; background: #0b1122; overflow: hidden; }
   canvas {
     display: block; width: 100vw; height: 100vh;
     font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -73,14 +73,26 @@ function dirGlyph(a) {
 // ---------- look ----------
 const params = new URLSearchParams(location.search);
 const SEED = Number(params.get("seed")) || 1 + ((Math.random() * 1e6) | 0);   // ?seed=123 to keep a branch
-const LEAVES = !params.has("bare");                                             // ?bare for wood only
-const BG = [6, 7, 12];
-const GRID = "rgba(255,255,255,0.058)";   // cell border lines
+const BG = [11, 17, 34];                  // night sky
+const SKY_GLOW = [36, 52, 92];            // the sky right around the moon
+const MOON = [238, 240, 236];
+const MOON_MARE = [188, 198, 214];        // the darker patches on it
+const GRID = "rgba(170,195,255,0.06)";     // cell border lines
 const RAMP = ".:;=+*#%@";                 // sparse -> dense, picked by brightness
-const BARK_LIGHT = [182, 144, 106];       // lit top of the wood
-const BARK_DARK = [50, 36, 30];           // shaded underside
-const LEAF_A = [64, 128, 60];
-const LEAF_B = [128, 166, 70];
+const BARK_LIGHT = [134, 128, 134];       // moonlit top of the wood
+const BARK_DARK = [24, 22, 34];           // shaded underside
+const SNOW = [234, 240, 252];
+const SNOW_SHADE = [132, 156, 204];       // snow in its own shadow, down near the bark
+const FLAKE = [214, 226, 248];
+const BERRY = [212, 34, 46];
+const BERRY_DARK = [86, 8, 22];
+const CAP = [56, 60, 92];                 // the bullfinch's "black": lifted so it shows against the night
+const CAP_INK = [128, 138, 184];
+const WHITE = [232, 236, 246];
+const BREAST_M = [234, 92, 86];
+const BREAST_F = [180, 142, 130];
+const BILL = [78, 80, 98];
+const REFILL = 24;                        // seconds for knocked-off snow to settle back
 const FUR = [196, 106, 52];
 const FUR_FAR = [112, 62, 36];            // legs on the far side of the body
 const BELLY = [234, 210, 174];
@@ -93,7 +105,7 @@ const LEVELS = 2;                         // how many times branches fork
 // ---------- the branch (continuous space, no grid involved) ----------
 let W = 0, H = 0, time = 0;
 const limbs = [];                         // parents always come before their children
-const leaves = [];
+const berries = [];
 
 const radius = (l, t) => lerp(l.r0, l.r1, Math.pow(t, 0.85));
 
@@ -108,6 +120,7 @@ function grow(parent, at, rel, len, r0, level, rnd) {
     bend: new Float32Array(n),            // angle change at each joint, at rest
     rest: new Float32Array(n),            // direction of each segment, at rest
     a: new Float32Array(n),               // direction of each segment, right now
+    snow: new Float32Array(n + 1).fill(1), // how much snow lies at each joint, 0..1
     x: new Float32Array(n + 1), y: new Float32Array(n + 1),
   };
   let a = (parent ? parent.rest[at - 1] : 0) + rel;
@@ -135,27 +148,63 @@ function grow(parent, at, rel, len, r0, level, rnd) {
     }
   }
 
-  // leaves sit along the thin green wood and at the tip
-  if (LEAVES) {
-    const size = clamp(Math.min(W, H) * 0.036, 12, 34);
-    const leaf = (at, rel) => leaves.push({
-      limb: l, at, rel, len: size * (0.8 + rnd() * 0.8),
-      ph: rnd() * TAU, tint: rnd(), front: rnd() < 0.55,
-    });
-    for (let k = 1; k < n; k++) {
-      if (radius(l, k / n) > 2.6 || rnd() > 0.4) continue;
-      leaf(k, side * (0.5 + rnd() * 0.7));
-      side = -side;
-    }
-    leaf(n, (rnd() - 0.5) * 0.4);
+  // berries hang in clusters along the thin wood and at the tip
+  for (let k = 1; k <= n; k++) {
+    if (radius(l, k / n) > 2.6 || rnd() > (k === n ? 0.75 : 0.4)) continue;
+    const count = 3 + ((rnd() * 5) | 0);
+    // `back` holds, for each berry, the time it grows back (0 = it is there)
+    berries.push({ limb: l, at: k, n: count, seed: (rnd() * 1e6) | 0, ph: rnd() * TAU, back: new Float32Array(count) });
   }
 }
 
 function build() {
-  limbs.length = 0; leaves.length = 0;
+  limbs.length = 0; berries.length = 0;
   sq.on = false; sq.at = time + 1.5;                              // the squirrel comes back to the new branch
   const rnd = mulberry(SEED);
   grow(null, 0, -0.1, W * 0.86, clamp(Math.min(W, H) * 0.05, 14, 46), 0, rnd);
+
+  flakes.length = 0; puffs.length = 0;
+  birds.forEach((b, i) => { b.on = false; b.at = time + 4 + i * 6 + rb() * 5 + (i === 2 ? 20 : 0); });
+  for (let i = 0, n = clamp(Math.round((W * H) / 8000), 40, 260); i < n; i++)
+    flakes.push({ x: Math.random() * W, y: Math.random() * H, z: Math.random(), ph: Math.random() * TAU });
+}
+
+// ---------- snow ----------
+const flakes = [];                        // falling snow; z is depth, 0 far away and 1 close
+const puffs = [];                         // snow knocked off the wood
+
+function puff(x, y) {
+  if (puffs.length > 90) return;
+  for (let i = 0; i < 3; i++)
+    puffs.push({ x: x + (Math.random() - 0.5) * 10, y: y - 2, vx: (Math.random() - 0.5) * 60, vy: -15 - Math.random() * 45, life: 0.8 + Math.random() * 0.7 });
+}
+
+function stepSnow(dt) {
+  const g = gust();
+  for (const f of flakes) {
+    // near flakes fall faster and are pushed harder by the wind
+    f.y += (16 + 44 * f.z) * dt;
+    f.x += (-(8 + 30 * f.z) * g + Math.sin(time * 0.9 + f.ph) * 7) * dt;
+    if (f.y > H + 5) { f.y = -5; f.x = Math.random() * W; }
+    if (f.x < -5) f.x = W + 5;
+  }
+  for (let i = puffs.length - 1; i >= 0; i--) {
+    const p = puffs[i];
+    p.vy += 260 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+    if (p.life <= 0 || p.y > H) puffs.splice(i, 1);
+  }
+  // snow settles back wherever it was knocked off
+  for (const l of limbs) for (let k = 0; k <= l.n; k++) if (l.snow[k] < 1) l.snow[k] = Math.min(1, l.snow[k] + dt / REFILL);
+}
+
+// Whatever lands or runs on the wood clears the snow under it, and it falls away in a puff.
+function clearSnow(l, s, reach = 0.4 * sq.size) {
+  const k0 = Math.max(0, Math.ceil((s - reach) / l.seg)), k1 = Math.min(l.n, Math.floor((s + reach) / l.seg));
+  for (let k = k0; k <= k1; k++) {
+    if (l.snow[k] > 0.35) { surf(l, k * l.seg); puff(P.x, P.y); }
+    l.snow[k] = 0;
+  }
 }
 
 // Work out where every joint is right now: the rest shape plus a sway that
@@ -412,6 +461,8 @@ function stepSquirrel(dt) {
     }
   }
   sq.flick *= Math.exp(-dt * 5);
+  if (sq.mode !== "hop") clearSnow(sq.l, sq.s);
+  else if (sq.hop.t > 1) clearSnow(sq.hop.l, sq.hop.s + sq.hop.dir * (sq.hop.t - 1) * sq.hop.len);
   skeleton(dt);
 }
 
@@ -514,6 +565,298 @@ function skeleton(dt) {
   sq.tailInit = true;
 }
 
+// ---------- bullfinches ----------
+// A pair, and now and then a third. Each one flies in, settles on thin wood
+// beside a bunch of berries, fidgets and feeds, and flies off again. They keep
+// clear of the squirrel and flush if it comes close.
+const rb = mulberry(SEED ^ 0x2545f491);
+const birdSize = () => clamp(Math.min(W, H) * 0.025, 9, 22);       // body radius, px
+const birds = [0, 1, 2].map((i) => ({
+  on: false, at: 0, male: i !== 1, extra: i === 2,
+  mode: "fly", x: 0, y: 0, face: 1,
+  l: null, s: 0, home: 0, cl: null,       // perch: limb, px along it, the spot it settled on, its berries
+  x0: 0, y0: 0, x1: 0, y1: 0, u: 0, T: 1, lift: 0, leaving: false, flapping: true,
+  ph: i * 0.37, flap: 0, act: 0, leaveAt: 0, tx: 0, ty: 0, up: false,
+  hop: 0, hopFrom: 0, hopTo: 0, peck: 0, pecked: true, look: 1, lookUntil: 0, fluff: 0,
+  lookAt: -9, flickAt: -9, landed: -9,    // when it last turned its head, flicked its tail, touched down
+  launch: 0, launchT: 1, hurry: false,    // counting down to a take-off
+}));
+
+const berriesLeft = (c) => { let n = 0; for (let j = 0; j < c.n; j++) if (c.back[j] <= time) n++; return n; };
+
+// Somewhere to sit: thin, fairly level wood on screen, preferably right beside
+// berries, away from the squirrel and from the other birds.
+function findPerch(b, clear) {
+  const B = birdSize();
+  for (let i = 0; i < 40; i++) {
+    let l, s, cl = null;
+    if (berries.length && rb() < 0.8) {
+      cl = berries[(rb() * berries.length) | 0];
+      if (!berriesLeft(cl)) continue;
+      l = cl.limb; s = Math.max(0, cl.at * l.seg - 1.2 * B);
+    } else {
+      l = limbs[(rb() * limbs.length) | 0]; s = rb() * l.len;
+    }
+    const r = radius(l, s / l.len);
+    if (r > 8 || r < 0.9) continue;
+    surf(l, s);
+    if (Math.abs(P.tx) < 0.5 || P.x < W * 0.06 || P.x > W * 0.94 || P.y < H * 0.1 || P.y > H * 0.92) continue;
+    if (sq.on && Math.hypot(P.x - sq.shx, P.y - sq.shy) < clear * sq.size) continue;
+    let taken = false;
+    for (const o of birds) if (o !== b && o.on && !o.leaving && o.l) { const x = P.x, y = P.y; surf(o.l, o.s); if (Math.hypot(P.x - x, P.y - y) < 4.5 * B) taken = true; P.x = x; P.y = y; }
+    if (taken) continue;
+    b.l = l; b.s = b.home = s; b.cl = cl;
+    return true;
+  }
+  return false;
+}
+
+// Take off for wherever it has decided to go. From a perch it first crouches
+// and throws its wings up, which takes a moment (less if it is startled).
+function flyOff(b, lift, hurry = false) {
+  b.lift = lift; b.hurry = hurry;
+  b.hop = 0; b.peck = 0; b.fluff = 0; b.look = 1;
+  if (b.mode === "perch") b.launch = b.launchT = hurry ? 0.14 : 0.24;
+  else beginFlight(b);
+}
+
+function beginFlight(b) {
+  b.mode = "fly"; b.x0 = b.x; b.y0 = b.y; b.u = 0; b.launch = 0;
+  let tx = b.x1, ty = b.y1;
+  if (!b.leaving) { surf(b.l, b.s); tx = P.x; ty = P.y; }
+  b.T = clamp(Math.hypot(tx - b.x, ty - b.y) / 340, 0.5, 4) * (b.hurry ? 0.75 : 1);
+}
+
+// Which drawing a perched bird shows right now. Every change of pose passes
+// through an in-between drawing, so nothing switches in a single step.
+function birdArt(b) {
+  if (b.launch > 0) return b.launch > 0.5 * b.launchT ? PERCHED.lean : PERCHED.flare;
+  const down = time - b.landed;
+  if (down < 0.14) return PERCHED.flare;                           // wings still up as it touches down
+  if (down < 0.3) return PERCHED.fold;
+  if (b.peck > 0) { const u = 1 - b.peck; return u < 0.22 || u > 0.78 ? PERCHED.lean : PERCHED.peck; }
+  const fl = time - b.flickAt;
+  if (fl < 0.42) return fl < 0.07 || fl > 0.3 ? PERCHED.flickMid : PERCHED.flick;
+  if (time - b.lookAt < 0.12) return PERCHED.front;                // head passes through face-on
+  if (b.look < 0) return PERCHED.look;
+  return b.fluff > 0.75 ? PERCHED.fluff : b.fluff > 0.45 ? PERCHED.fluffMid : PERCHED.up;
+}
+
+function leave(b, hurry = false) {
+  b.leaving = true;
+  b.x1 = b.x > W / 2 ? W + 80 : -80;
+  b.y1 = b.y - 60 - rb() * 220;
+  flyOff(b, 0, hurry);
+}
+
+function stepBirds(dt) {
+  const B = birdSize();
+  for (const b of birds) {
+    if (!b.on) {
+      if (time < b.at || !limbs.length) continue;
+      if (!findPerch(b, 2.6)) { b.at = time + 3; continue; }
+      b.on = true; b.leaving = false;
+      b.x = rb() < 0.5 ? -60 : W + 60; b.y = H * (0.05 + rb() * 0.5);
+      b.leaveAt = time + 25 + rb() * 45;
+      b.mode = "fly";
+      flyOff(b, 0);
+    }
+    if (b.launch > 0) {                                            // gathering itself to take off
+      b.launch -= dt;
+      if (b.launch <= 0) beginFlight(b);
+      continue;
+    }
+
+    if (b.mode === "fly") {
+      b.u += dt / b.T;
+      b.flap += dt * 9;
+      let tx = b.x1, ty = b.y1;
+      if (!b.leaving) { surf(b.l, b.s); tx = P.x; ty = P.y - 0.85 * B; }
+      const u = Math.min(1, b.u);
+      const e = b.leaving ? u * (0.5 + 0.5 * u) : 1 - Math.pow(1 - u, 1.7);   // slows into a landing
+      // Finches fly in bounds: a burst of flapping that climbs, then wings
+      // shut and a dip. It fades out near the perch at either end.
+      const env = smooth(clamp(u * 4, 0, 1)) * (b.leaving ? 1 : smooth(clamp((1 - u) * 3, 0, 1)));
+      const cyc = (time * 1.9 + b.ph) % 1;
+      b.flapping = cyc < 0.55 || u < 0.12 || (!b.leaving && u > 0.8);
+      if (Math.abs(tx - b.x0) > 4) b.face = tx > b.x0 ? 1 : -1;
+      b.x = lerp(b.x0, tx, e);
+      b.y = lerp(b.y0, ty, e) - Math.sin(cyc * TAU) * 14 * env - b.lift * Math.sin(Math.PI * u);
+      if (b.u >= 1) {
+        if (b.leaving) { b.on = false; b.at = time + (b.extra ? 30 + rb() * 60 : 8 + rb() * 22); continue; }
+        b.mode = "perch"; b.act = time + 0.6 + rb(); b.landed = time;
+        clearSnow(b.l, b.s, 1.1 * B);
+      } else continue;                                             // still in the air
+    }
+
+    // perched
+    let s = b.s, bump = 0;
+    if (b.hop > 0) {
+      b.hop -= dt / 0.16;
+      const k = 1 - Math.max(0, b.hop);
+      s = lerp(b.hopFrom, b.hopTo, smooth(k)); bump = Math.sin(Math.PI * k) * 0.4 * B;
+      if (b.hop <= 0) { b.s = b.hopTo; clearSnow(b.l, b.s, 0.8 * B); }
+    }
+    surf(b.l, s);
+    b.x = P.x; b.y = P.y - 0.85 * B - bump;
+    b.tx = P.x; b.ty = P.y + radius(b.l, clamp(s / b.l.len, 0, 1)); b.up = bump > 0.2 * B;   // the twig under its feet
+    if (b.cl) { const cx = b.cl.limb.x[b.cl.at]; if (Math.abs(cx - b.x) > 2) b.face = cx > b.x ? 1 : -1; }
+
+    if (b.peck > 0) {
+      b.peck -= dt / 0.5;
+      if (b.peck < 0.5 && !b.pecked) {
+        b.pecked = true;
+        for (let j = 0; j < b.cl.n; j++) if (b.cl.back[j] <= time) { b.cl.back[j] = time + 45 + rb() * 45; break; }
+      }
+    }
+    b.fluff = Math.min(1, b.fluff + dt * 0.1);                    // slowly puffs up while it sits
+    if (b.look < 0 && time > b.lookUntil) { b.look = 1; b.lookAt = time; }
+
+    // the squirrel: flush if it is running or jumping nearby, or simply too close
+    if (sq.on && Math.hypot(b.x - sq.shx, b.y - sq.shy) < sq.size * (sq.mode === "pause" ? 1.1 : 2)) {
+      b.leaving = false;
+      if (findPerch(b, 3.6)) flyOff(b, 40 + rb() * 50, true); else leave(b, true);
+      continue;
+    }
+    // it only starts something new once the last movement has finished
+    const settled = b.hop <= 0 && b.peck <= 0 && b.look > 0 && time - b.lookAt > 0.15 && time - b.flickAt > 0.45 && time - b.landed > 0.35;
+    if (time > b.leaveAt && settled) { leave(b); continue; }
+
+    if (time > b.act && settled) {
+      b.act = time + 0.5 + rb() * 2.2;
+      const r = rb(), atHome = Math.abs(b.s - b.home) < 0.4 * B, food = b.cl && berriesLeft(b.cl) > 0;
+      if (b.cl && !food) {
+        if (findPerch(b, 2.6)) flyOff(b, 20); else leave(b);      // stripped this bunch: on to the next
+      } else if (food && atHome && r < 0.45) {
+        b.peck = 1; b.pecked = false; b.look = 1; b.fluff *= 0.4;
+      } else if (r < 0.65) {
+        b.hop = 1; b.hopFrom = b.s; b.fluff *= 0.5;
+        b.hopTo = atHome ? clamp(b.home + (rb() < 0.5 ? -1 : 1) * (0.5 + rb() * 0.5) * B, 0, b.l.len) : b.home;
+      } else if (r < 0.82) {
+        b.look = -1; b.lookAt = time; b.lookUntil = time + 0.6 + rb();   // glances over its shoulder
+      } else if (r < 0.94) {
+        b.flickAt = time;
+      } else if (findPerch(b, 2.6)) flyOff(b, 20);
+    }
+  }
+}
+
+// A perched bullfinch is too small to build from shapes, so it is drawn by
+// hand, one character per cell, facing right. K is the black of the cap, wing
+// and tail, R the breast and cheek, W the white rump, E the eye, B the bill
+// (V when it points down). The feet are under column 7 of the bottom row.
+const PERCHED = {
+  up: [
+    "       KKK    ",
+    "      KKEKB   ",
+    "     KKRRR    ",
+    "   KKKKRRRR   ",
+    "  KKKKRRRRR   ",
+    " KKWWRRRRR    ",
+    "KK    RRR     ",
+  ],
+  look: [                                 // glancing back over its shoulder
+    "      KKK     ",
+    "     BKEKK    ",
+    "      RRRKK   ",
+    "   KKKKRRRR   ",
+    "  KKKKRRRRR   ",
+    " KKWWRRRRR    ",
+    "KK    RRR     ",
+  ],
+  fluff: [                                // puffed up against the cold
+    "       KKK    ",
+    "      KKEKB   ",
+    "    KKKRRRR   ",
+    "  KKKKKRRRRR  ",
+    " KKKKKRRRRRR  ",
+    " KKWWRRRRRR   ",
+    "KK   RRRRR    ",
+  ],
+  flick: [                                // tail cocked up
+    "       KKK    ",
+    "      KKEKB   ",
+    "KK   KKRRR    ",
+    " KKKKKKRRRR   ",
+    "  KKKKRRRRR   ",
+    "   WWRRRRR    ",
+    "      RRR     ",
+  ],
+  // in-between drawings
+  lean: [                                 // tipping forward: on the way to a peck, or crouching to take off
+    "              ",
+    "        KKK   ",
+    "    KKKKKEKB  ",
+    "  KKKKKRRRRR  ",
+    " KKKKRRRRRR   ",
+    "KKWWRRRRRR    ",
+    "      RRR     ",
+  ],
+  front: [                                // head face-on, halfway through a turn
+    "      KKKK    ",
+    "      EKKE    ",
+    "     KRRRR    ",
+    "   KKKKRRRR   ",
+    "  KKKKRRRRR   ",
+    " KKWWRRRRR    ",
+    "KK    RRR     ",
+  ],
+  flickMid: [                             // tail level, halfway up
+    "       KKK    ",
+    "      KKEKB   ",
+    "     KKRRR    ",
+    "   KKKKRRRR   ",
+    "KKKKKKRRRRR   ",
+    "   WWRRRRR    ",
+    "      RRR     ",
+  ],
+  fluffMid: [
+    "       KKK    ",
+    "      KKEKB   ",
+    "     KKRRRR   ",
+    "   KKKKRRRRR  ",
+    "  KKKKRRRRRR  ",
+    " KKWWRRRRRR   ",
+    "KK    RRRR    ",
+  ],
+  flare: [                                // wings thrown up: braking to land, or springing off
+    "   KK         ",
+    "   KKK        ",
+    "    KK KKK    ",
+    "     KKKEKB   ",
+    "     KKRRR    ",
+    "    KKKRRRR   ",
+    "    KWRRRRR   ",
+    "   KKWRRRR    ",
+    "  KK  RRR     ",
+  ],
+  fold: [                                 // wings coming down to close
+    "       KKK    ",
+    " KK   KKEKB   ",
+    "  KKKKKRRR    ",
+    "   KKKKRRRR   ",
+    "  KKKKRRRRR   ",
+    " KKWWRRRRR    ",
+    "KK    RRR     ",
+  ],
+  peck: [                                 // leaning down to the berries
+    "              ",
+    "              ",
+    "    KKKK      ",
+    "  KKKKKRRKK   ",
+    " KKKKRRRRKEK  ",
+    "KKWWRRRRRRKV  ",
+    "      RRR     ",
+  ],
+};
+
+// Is (px,py) inside the tapered capsule a->b? Returns how far along (0..1), or -1.
+function inCapsule(px, py, ax, ay, bx, by, ra, rb2) {
+  const dx = bx - ax, dy = by - ay, t = clamp(((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy || 1), 0, 1);
+  const ex = px - (ax + dx * t), ey = py - (ay + dy * t), r = lerp(ra, rb2, t);
+  return ex * ex + ey * ey <= r * r ? t : -1;
+}
+
 // ---------- renderer (everything snaps to the character grid here) ----------
 const renderer = {
   canvas: null, ctx: null, bg: null, dpr: 1,
@@ -533,11 +876,46 @@ const renderer = {
     this.canvas.width = Math.round(w * dpr);
     this.canvas.height = Math.round(h * dpr);
 
-    // static backdrop: flat colour and the cell grid
+    // static backdrop: night sky, stars, the moon and the cell grid
     this.bg.width = this.canvas.width; this.bg.height = this.canvas.height;
     const b = this.bg.getContext("2d");
+    b.setTransform(dpr, 0, 0, dpr, 0, 0);
     b.fillStyle = `rgb(${BG})`;
-    b.fillRect(0, 0, this.bg.width, this.bg.height);
+    b.fillRect(0, 0, w, h);
+    const { cw, ch, cols, rows } = this;
+    const mx = w * 0.8, my = h * 0.2, mr = clamp(Math.min(w, h) * 0.085, 30, 80);   // the moon
+    b.font = `600 ${Math.round(ch * 0.78)}px ${this.font}`;
+    b.textAlign = "center";
+    b.textBaseline = "middle";
+    const STEPS = 7;
+    for (let r = 0; r < rows; r++)
+      for (let c = 0; c < cols; c++) {
+        const x = (c + 0.5) * cw, y = (r + 0.5) * ch, d = Math.hypot(x - mx, y - my);
+        if (d < mr) {
+          // the disc: pale, with darker seas, and dimmer toward the limb
+          const mare = noise2(x / (mr * 0.55), y / (mr * 0.55), 77) > 0.56;
+          const col = mare ? MOON_MARE : MOON, k = 1 - 0.14 * (d / mr) * (d / mr);
+          b.fillStyle = `rgb(${Math.round(col[0] * k)},${Math.round(col[1] * k)},${Math.round(col[2] * k)})`;
+          b.fillRect(c * cw + 1, r * ch + 1, cw - 1, ch - 1);
+          if (mare) { b.fillStyle = "rgba(120,134,160,0.9)"; b.fillText(hash(c, r, 5) < 0.5 ? "." : ":", x, y); }
+          continue;
+        }
+        // the glow around it, stepped like contour bands, with dithered edges
+        const glow = Math.pow(clamp(1 - (d - mr) / (mr * 6.5), 0, 1), 2.2);
+        const band = Math.round(glow * STEPS + (hash(c, r, 21) - 0.5) * 0.6);
+        if (band > 0) {
+          const t = Math.min(STEPS, band) / STEPS;
+          b.fillStyle = `rgb(${Math.round(lerp(BG[0], SKY_GLOW[0], t))},${Math.round(lerp(BG[1], SKY_GLOW[1], t))},${Math.round(lerp(BG[2], SKY_GLOW[2], t))})`;
+          b.fillRect(c * cw, r * ch, cw, ch);
+        }
+        // stars, fewer where the moon washes them out
+        const st = hash(c, r, 31);
+        if (st < 0.0035 * (1 - glow)) {
+          b.fillStyle = `rgba(214,226,255,${(0.25 + 0.5 * hash(c, r, 32)).toFixed(2)})`;
+          b.fillText(st < 0.0006 ? "+" : ".", x, y);
+        }
+      }
+    b.setTransform(1, 0, 0, 1, 0, 0);
     b.strokeStyle = GRID;
     b.lineWidth = 1;
     b.beginPath();
@@ -562,19 +940,38 @@ const renderer = {
     return pack(lerp(BARK_DARK[0], BARK_LIGHT[0], lum) * k, lerp(BARK_DARK[1], BARK_LIGHT[1], lum) * k, lerp(BARK_DARK[2], BARK_LIGHT[2], lum) * k);
   },
 
+  snowTone(f) {
+    return pack(lerp(SNOW_SHADE[0], SNOW[0], f), lerp(SNOW_SHADE[1], SNOW[1], f), lerp(SNOW_SHADE[2], SNOW[2], f));
+  },
+
   // Rasterize one limb: each segment is a tapered capsule. A cell inside it is
   // placed in limb coordinates (how far along, how far off the centre line),
-  // which is what the shading and the bark grain are read from.
+  // which is what the shading and the bark grain are read from. Snow lies on
+  // whatever part of the surface faces up: partly sunk into the outline, partly
+  // heaped above it.
   drawLimb(l) {
     const { cw, ch, cols, rows } = this;
     for (let k = 0; k < l.n; k++) {
       const ax = l.x[k], ay = l.y[k], bx = l.x[k + 1], by = l.y[k + 1];
       const ra = radius(l, k / l.n), rb = radius(l, (k + 1) / l.n);
+      const sa = l.snow[k], sb = l.snow[k + 1];
 
       if (ra < ch * 0.6) {
         // too thin to reliably cover cell centres: walk the line instead
         const steps = Math.max(1, Math.ceil(l.seg / (cw * 0.5)));
         const solid = ra > cw * 0.4;
+        if (solid && Math.abs(Math.cos(l.a[k])) > 0.75) {
+          // a level twig carries a line of snow, one cell deep
+          for (let j = 0; j <= steps; j++) {
+            if (lerp(sa, sb, j / steps) < 0.5) continue;
+            const i = this.cellIndex(lerp(ax, bx, j / steps), lerp(ay, by, j / steps) - ch);
+            if (i < 0) continue;
+            this.flag[i] = 1;
+            this.fill[i] = this.snowTone(0.8);
+            this.glyph[i] = 46;
+            this.colour[i] = this.snowTone(0.1);
+          }
+        }
         for (let j = 0; j <= steps; j++) {
           const i = this.cellIndex(lerp(ax, bx, j / steps), lerp(ay, by, j / steps));
           if (i < 0) continue;
@@ -587,14 +984,36 @@ const renderer = {
       }
 
       const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy || 1, len = Math.sqrt(len2);
-      const c0 = Math.max(0, Math.floor((Math.min(ax, bx) - ra) / cw)), c1 = Math.min(cols - 1, Math.floor((Math.max(ax, bx) + ra) / cw));
-      const r0 = Math.max(0, Math.floor((Math.min(ay, by) - ra) / ch)), r1 = Math.min(rows - 1, Math.floor((Math.max(ay, by) + ra) / ch));
+      const heap = clamp(ra * 0.45, ch * 0.7, ch * 1.5);            // deepest the snow gets on wood this thick
+      const c0 = Math.max(0, Math.floor((Math.min(ax, bx) - ra - heap) / cw)), c1 = Math.min(cols - 1, Math.floor((Math.max(ax, bx) + ra + heap) / cw));
+      const r0 = Math.max(0, Math.floor((Math.min(ay, by) - ra - heap) / ch)), r1 = Math.min(rows - 1, Math.floor((Math.max(ay, by) + ra) / ch));
       for (let r = r0; r <= r1; r++) {
         for (let c = c0; c <= c1; c++) {
           const x = c * cw + cw / 2, y = r * ch + ch / 2;
           const t = clamp(((x - ax) * dx + (y - ay) * dy) / len2, 0, 1);
           const ex = x - (ax + dx * t), ey = y - (ay + dy * t);
           const dist = Math.hypot(ex, ey), rad = lerp(ra, rb, t);
+          const i = r * cols + c;
+
+          // snow: only where the surface faces upward, deepest where it faces straight up
+          const up = dist > 0 ? -ey / dist : 0;
+          const depth = up > 0.35 ? lerp(sa, sb, t) * clamp(rad * 0.45, ch * 0.7, ch * 1.5) * smooth(clamp((up - 0.35) / 0.45, 0, 1)) : 0;
+          const top = rad + depth * 0.65;
+          if (dist > top) continue;
+          if (depth > 1 && dist > rad - depth * 0.35) {
+            const f = clamp((dist - (rad - depth * 0.35)) / depth, 0, 1);   // 0 against the bark, 1 at the crest
+            this.flag[i] = 1;
+            if (top - dist < cw * 0.3) {
+              this.fill[i] = 0;                                    // crest: a bare character
+              this.glyph[i] = hash(c, r, 4) < 0.5 ? 46 : 58;
+              this.colour[i] = this.snowTone(1);
+            } else {
+              this.fill[i] = this.snowTone(0.25 + 0.75 * f);
+              this.glyph[i] = hash(c, r, 4) < 0.7 ? 46 : 58;
+              this.colour[i] = this.snowTone(0.25 + 0.75 * f - 0.3);
+            }
+            continue;
+          }
           if (dist > rad) continue;
 
           const along = (k + t) * l.seg;                           // px from the limb's base
@@ -603,7 +1022,6 @@ const renderer = {
           const grain = noise2(along / 26, off / 4 + 50, l.seed);  // streaks running along the wood
           const lum = clamp((0.62 - 0.38 * (ey / rad)) * round * (0.72 + 0.56 * grain), 0, 1);
           const jitter = Math.floor(hash(Math.round(along / cw), Math.round(off / cw), l.seed) * 3) - 1;
-          const i = r * cols + c;
           this.flag[i] = 1;
           if (rad - dist < cw * 0.3) {
             // rim cell, only partly covered: a bare character, no block behind it
@@ -625,39 +1043,52 @@ const renderer = {
     }
   },
 
-  // A leaf: a pointed oval with a midrib and veins angled off it.
-  drawLeaf(f, g) {
-    const { cw, ch, cols, rows } = this;
-    const l = f.limb;
-    const x0 = l.x[f.at], y0 = l.y[f.at];
-    const a = l.a[f.at - 1] + f.rel + 0.16 * g * Math.sin(time * 2.1 + f.ph);   // flutter
-    const ca = Math.cos(a), sa = Math.sin(a), L = f.len;
-    const x1 = x0 + ca * L, y1 = y0 + sa * L, pad = L * 0.36;
-    const c0 = Math.max(0, Math.floor((Math.min(x0, x1) - pad) / cw)), c1 = Math.min(cols - 1, Math.floor((Math.max(x0, x1) + pad) / cw));
-    const r0 = Math.max(0, Math.floor((Math.min(y0, y1) - pad) / ch)), r1 = Math.min(rows - 1, Math.floor((Math.max(y0, y1) + pad) / ch));
-    const dim = f.front ? 1 : 0.5;                                 // leaves behind the wood sit in shadow
-    for (let r = r0; r <= r1; r++) {
-      for (let c = c0; c <= c1; c++) {
-        const px = c * cw + cw / 2 - x0, py = r * ch + ch / 2 - y0;
-        const u = (px * ca + py * sa) / L, v = -px * sa + py * ca;
-        if (u <= 0 || u >= 1) continue;
-        const w = 0.34 * L * Math.sin(Math.PI * Math.pow(u, 0.75)), av = Math.abs(v);
-        if (av > w) continue;
-        const k = dim * (0.75 + 0.3 * u) * (v * ca < 0 ? 1.08 : 0.88);   // upper half catches more light
-        const tone = pack(lerp(LEAF_A[0], LEAF_B[0], f.tint) * k, lerp(LEAF_A[1], LEAF_B[1], f.tint) * k, lerp(LEAF_A[2], LEAF_B[2], f.tint) * k);
-        const rib = av < cw * 0.5;
-        const i = r * cols + c;
+  // Berries: each one is a single red cell, hanging in a loose bunch that
+  // swings a little with the twig.
+  drawBerries(g) {
+    const { cw, ch } = this;
+    for (const b of berries) {
+      const l = b.limb;
+      const x0 = l.x[b.at] + Math.sin(time * 1.3 + b.ph) * g * 2.5, y0 = l.y[b.at];
+      for (let j = 0; j < b.n; j++) {
+        if (b.back[j] > time) continue;                            // eaten
+        const i = this.cellIndex(x0 + (hash(j, 1, b.seed) - 0.5) * cw * 3.4, y0 + ch * (0.5 + hash(j, 2, b.seed) * 2.1));
+        if (i < 0) continue;
+        const k = 0.72 + 0.36 * hash(j, 3, b.seed);
         this.flag[i] = 1;
-        this.glyph[i] = rib ? dirGlyph(a) : hash(c, r, 9) < 0.45 ? dirGlyph(a + Math.sign(v) * 0.9) : 58;
-        if (w - av < cw * 0.3) {
-          this.fill[i] = 0;
-          this.colour[i] = tone;
-        } else {
-          this.fill[i] = tone || 1;
-          const d = rib ? 0.42 : 0.6;
-          this.colour[i] = pack((tone >>> 16) * d, ((tone >>> 8) & 255) * d, (tone & 255) * d);
-        }
+        this.fill[i] = pack(BERRY[0] * k, BERRY[1] * k, BERRY[2] * k);
+        this.glyph[i] = 111;                                       // o
+        this.colour[i] = pack(BERRY_DARK[0], BERRY_DARK[1], BERRY_DARK[2]);
       }
+    }
+  },
+
+  // Falling snow. Far flakes are small dim dots that anything can cover; near
+  // ones are drawn last, over whatever is in the cell.
+  drawFlakes(front) {
+    for (const f of flakes) {
+      if (f.z >= 0.6 !== front) continue;
+      const i = this.cellIndex(f.x, f.y);
+      if (i < 0) continue;
+      if (!front) {
+        if (this.flag[i]) continue;
+        const k = 0.45 + 0.9 * f.z;
+        this.flag[i] = 1; this.fill[i] = 0;
+        this.glyph[i] = f.z < 0.3 ? 46 : 0xb7;                     // . and ·
+        this.colour[i] = pack(lerp(BG[0], FLAKE[0], k), lerp(BG[1], FLAKE[1], k), lerp(BG[2], FLAKE[2], k));
+      } else {
+        if (!this.flag[i]) { this.flag[i] = 1; this.fill[i] = 0; }
+        this.glyph[i] = f.z > 0.78 ? 42 : 0xb7;                    // * and ·
+        this.colour[i] = pack(FLAKE[0] + 20, FLAKE[1] + 16, FLAKE[2]);
+      }
+    }
+    if (!front) return;
+    for (const p of puffs) {
+      const i = this.cellIndex(p.x, p.y);
+      if (i < 0) continue;
+      if (!this.flag[i]) { this.flag[i] = 1; this.fill[i] = 0; }
+      this.glyph[i] = p.life > 0.5 ? 42 : 46;
+      this.colour[i] = pack(SNOW[0], SNOW[1], SNOW[2]);
     }
   },
 
@@ -725,6 +1156,93 @@ const renderer = {
     this.colour[i] = pack(TAIL[0] * 0.5, TAIL[1] * 0.5, TAIL[2] * 0.5);
   },
 
+  // A perched bullfinch: stamp the hand-drawn pattern, bottom row sitting on
+  // the cell above the twig. It only ever moves by whole cells, so it stays
+  // crisp while the twig sways under it.
+  drawPerched(b) {
+    const { cw, ch, cols, rows } = this;
+    const art = birdArt(b);
+    const breast = b.male ? BREAST_M : BREAST_F;
+    const c0 = Math.floor(b.tx / cw), r0 = Math.floor(b.ty / ch) - 1 - (b.up ? 1 : 0);
+    for (let j = 0; j < art.length; j++) {
+      const r = r0 - (art.length - 1 - j);
+      if (r < 0 || r >= rows) continue;
+      for (let q = 0; q < 14; q++) {
+        const t = art[j].charCodeAt(q);
+        if (t === 32) continue;
+        const c = c0 + b.face * (q - 7);
+        if (c < 0 || c >= cols) continue;
+        const i = r * cols + c;
+        const dark = t === 75 || t === 69;                         // K, E
+        const col = dark ? CAP : t === 82 ? breast : t === 87 ? WHITE : BILL;
+        const k = dark ? 1.12 - 0.04 * j : t === 82 ? 1.08 - 0.045 * j : 1;   // a little lighter toward the top
+        this.flag[i] = 1;
+        this.fill[i] = pack(col[0] * k, col[1] * k, col[2] * k) || 1;
+        if (t === 66 || t === 86) {                                // B, V: the bill
+          this.glyph[i] = t === 86 ? 118 : b.face > 0 === (art !== PERCHED.look) ? 62 : 60;   // v, > or <
+          this.colour[i] = pack(WHITE[0], WHITE[1], WHITE[2]);
+        } else if (t === 69) {
+          this.glyph[i] = 0x2022;                                  // • the eye, as a glint in the cap
+          this.colour[i] = pack(WHITE[0], WHITE[1], WHITE[2]);
+        } else {
+          this.glyph[i] = hash(q, j, 6) < 0.6 ? 46 : 58;           // fixed per cell of the drawing, so it never crawls
+          this.colour[i] = dark ? pack(CAP_INK[0], CAP_INK[1], CAP_INK[2]) : pack(col[0] * k * 0.6, col[1] * k * 0.6, col[2] * k * 0.6);
+        }
+      }
+    }
+  },
+
+  // A bullfinch in flight is built in its own coordinates (x toward the bill,
+  // y up) from a few overlapping shapes; each cell takes the colour of the
+  // topmost shape it falls in and of where on that shape it is.
+  drawBird(b) {
+    if (b.mode !== "fly") return this.drawPerched(b);
+    const { cw, ch, cols, rows } = this;
+    const B = birdSize(), f = b.face;
+    const breast = b.male ? BREAST_M : BREAST_F;
+    const b0x = -0.5 * B, b0y = 0, b1x = 0.4 * B, b1y = 0, br = 0.75 * B;
+    const hx = 0.95 * B, hy = 0.3 * B, hr = 0.55 * B;
+    const t0x = -0.9 * B, t0y = 0, t1x = -2 * B, t1y = 0.05 * B;
+    let w0x = 0.1 * B, w0y = 0.25 * B, w1x = -0.9 * B, w1y = 0.05 * B, wr0 = 0.45 * B, wr1 = 0.25 * B;   // wings shut
+    if (b.flapping) {
+      const up = Math.sin(b.flap * TAU) > 0;
+      w0x = 0; w0y = up ? 0.3 * B : -0.2 * B; w1x = -0.35 * B; w1y = up ? 1.9 * B : -1.7 * B; wr0 = 0.55 * B; wr1 = 0.2 * B;
+    }
+    const c0 = Math.max(0, Math.floor((b.x - 2.5 * B) / cw)), c1 = Math.min(cols - 1, Math.floor((b.x + 2.5 * B) / cw));
+    const r0 = Math.max(0, Math.floor((b.y - 2.3 * B) / ch)), r1 = Math.min(rows - 1, Math.floor((b.y + 2.1 * B) / ch));
+    for (let r = r0; r <= r1; r++) {
+      for (let c = c0; c <= c1; c++) {
+        const lx = (c * cw + cw / 2 - b.x) * f, ly = b.y - (r * ch + ch / 2);
+        let col = null, dark = false;
+        const dx = lx - hx, dy = ly - hy;
+        if (dx * dx + dy * dy <= hr * hr) {
+          dark = dy > 0 || (dx > 0.3 * hr && dy > -0.45 * hr);     // black cap and face, coloured cheek below
+          col = dark ? CAP : breast;
+        } else if (inCapsule(lx, ly, w0x, w0y, w1x, w1y, wr0, wr1) >= 0) {
+          dark = true; col = CAP;
+        } else if (inCapsule(lx, ly, b0x, b0y, b1x, b1y, br, br) >= 0) {
+          if (lx < -0.55 * B && ly > -0.2 * B) col = WHITE;        // rump
+          else if (ly > 0.3 * B && lx < 0.35 * B) { dark = true; col = CAP; }
+          else col = breast;
+        } else if (inCapsule(lx, ly, t0x, t0y, t1x, t1y, 0.32 * B, 0.22 * B) >= 0) {
+          dark = true; col = CAP;
+        } else continue;
+        const k = clamp(1 + 0.14 * (ly / B), 0.8, 1.15), i = r * cols + c;
+        this.flag[i] = 1;
+        this.fill[i] = pack(col[0] * k, col[1] * k, col[2] * k) || 1;
+        this.glyph[i] = 46;
+        this.colour[i] = dark ? pack(CAP_INK[0], CAP_INK[1], CAP_INK[2]) : pack(col[0] * k * 0.6, col[1] * k * 0.6, col[2] * k * 0.6);
+      }
+    }
+    const i = this.cellIndex(b.x + f * (hx + hr * 1.1), b.y - (hy - 0.1 * hr));
+    if (i >= 0) {
+      this.flag[i] = 1;
+      this.fill[i] = pack(BILL[0], BILL[1], BILL[2]);
+      this.glyph[i] = f > 0 ? 62 : 60;                             // > or <
+      this.colour[i] = pack(WHITE[0], WHITE[1], WHITE[2]);
+    }
+  },
+
   drawSquirrel() {
     if (!sq.on) return;
     const S = sq.size, fur = this.paintFur;
@@ -774,10 +1292,12 @@ const renderer = {
     const { ctx, dpr, cols, cw, ch } = this;
     const g = gust();
     this.flag.fill(0);
-    for (const f of leaves) if (!f.front) this.drawLeaf(f, g);     // leaves behind the wood
+    this.drawFlakes(false);                                        // distant snow, behind everything
     for (let i = limbs.length - 1; i >= 0; i--) this.drawLimb(limbs[i]);   // twigs first, the main limb on top
+    this.drawBerries(g);
     this.drawSquirrel();
-    for (const f of leaves) if (f.front) this.drawLeaf(f, g);
+    for (const b of birds) if (b.on) this.drawBird(b);
+    this.drawFlakes(true);                                         // snow falling in front
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.drawImage(this.bg, 0, 0);
@@ -828,7 +1348,9 @@ let last = 0;
 function tick(dt) {
   time += dt;
   pose();
+  stepSnow(dt);
   stepSquirrel(dt);
+  stepBirds(dt);
 }
 
 function frame(now) {
