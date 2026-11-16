@@ -3,17 +3,27 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ascii koi</title>
+<title>ascii scenes</title>
 <style>
   html, body { margin: 0; height: 100%; background: #06070c; overflow: hidden; }
   canvas {
     display: block; width: 100vw; height: 100vh;
     font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   }
+  nav a {
+    position: absolute; display: block; overflow: hidden; color: transparent; outline: none;
+    user-select: none; -webkit-tap-highlight-color: transparent;
+  }
 </style>
 </head>
 <body>
 <canvas aria-hidden="true"></canvas>
+<nav aria-label="Scenes">
+  <a href="koi.html">Koi pond</a>
+  <a href="branch.html">Winter branch</a>
+  <a href="station.html">Orbital station</a>
+  <a href="depot.html">Freight depot</a>
+</nav>
 <script>
 "use strict";
 
@@ -38,809 +48,406 @@ function noise2(x, y, s) {
   );
 }
 const noise1 = (x, s) => noise2(x, 0, s);
-function angleDiff(a, b) {
-  let d = (a - b) % TAU;
-  if (d > Math.PI) d -= TAU;
-  if (d < -Math.PI) d += TAU;
-  return d;
-}
 const pack = (r, g, b) => (clamp(r | 0, 0, 255) << 16) | (clamp(g | 0, 0, 255) << 8) | clamp(b | 0, 0, 255);
-// Colour strings are cached (colours rounded to 32 steps per channel so the
-// cache stays small); building and parsing one per cell per frame adds up.
 const cssCache = new Map();
 function css(c) {
-  c &= 0xf8f8f8;
-  let v = cssCache.get(c);
-  if (v === undefined) cssCache.set(c, (v = `rgb(${c >>> 16},${(c >>> 8) & 255},${c & 255})`));
-  return v;
+  let s = cssCache.get(c);
+  if (!s) { s = `rgb(${c >>> 16},${(c >>> 8) & 255},${c & 255})`; cssCache.set(c, s); }
+  return s;
 }
 
-// ---------- look ----------
+const params = new URLSearchParams(location.search);
 const BG = [6, 7, 12];
-const SHALLOW = [10, 26, 36];      // water colour over the shallowest floor
-const LIGHT = [150, 215, 230];     // sunlight ripples
-const LIGHT_EVERY = 0.1;            // seconds between ripple updates
-const BANDS = 5;                   // depth steps between deep and shallow
-const POND = (Math.random() * 1e6) | 0;   // seed for this pond's floor
-const WAKE_STYLES = [1, 2, 3, 4, 5, 6].map((k) => `rgba(110,165,175,${(k * 0.117).toFixed(3)})`);
-const GRID = "rgba(255,255,255,0.058)";   // cell border lines
-const RAMP = ".:;=+*#%@";          // sparse -> dense, picked by brightness
-const WHITE = [240, 238, 228];
-const RED = [236, 86, 40];
-const ORANGE = [245, 142, 52];
-const GOLD = [240, 188, 72];
-const SUMI = [72, 80, 98];
-const PIKE = [104, 136, 68];
-const PIKE_SPOT = [206, 216, 140];
-const PIKE_DARK = [62, 88, 50];
-const EYE = [12, 14, 18];
-const WAKE = [110, 165, 175];
-const VARIETIES = ["kohaku", "sanke", "showa", "ogon", "hi", "kohaku"];
-const FIN_TINT = 0.7;              // how see-through the fin blocks are
-const FOG = 0.62;                  // how much the deepest fish fade into the water
+const TEX = "#%&@$8B0";                                             // glyphs printed on solid cells
 
-// Colour of the body at a point given in body coordinates:
-// s runs 0 (nose) to 1 (tail tip), dl is the sideways offset in body lengths.
-function bodyColour(f, s, dl) {
-  const col = patchColour(f, s, dl);
-  if (col === SUMI || f.variety === "pike") return col;
+// ---------- the character grid ----------
+let W = 0, H = 0, cols = 0, rows = 0, cw = 6, ch = 9, dpr = 1, time = 0;
+let flag, glyph, colour, fill;                                      // flag: 1 = bare glyph, 2 = solid block
+let K = { x: 0, y: 0, w: 0, h: 0 };                                 // the rectangle being drawn into
+const whole = () => { K = { x: 0, y: 0, w: cols, h: rows }; };
 
-  // Subtle gradient: paler toward the head, deeper and warmer toward the tail,
-  // with soft cloudy variation and a slight tint of its own for each fish.
-  const strength = col === WHITE ? 0.35 : col === RED ? 0.7 : 1;
-  const cloud = noise2(s * 3, dl * 8, f.seed + 11) - 0.5;
-  const tone = hash(f.seed, 3, 9) - 0.5;
-  const k = ((s - 0.3) * 1.3 + cloud * 0.55 + tone * 0.35) * strength;
-  if (k > 0) {
-    tinted[0] = col[0] * (1 - 0.2 * k); tinted[1] = col[1] * (1 - 0.5 * k); tinted[2] = col[2] * (1 - 0.6 * k);
-  } else {
-    tinted[0] = col[0] + (255 - col[0]) * -k * 0.85; tinted[1] = col[1] + (255 - col[1]) * -k * 0.85; tinted[2] = col[2] + (255 - col[2]) * -k * 0.85;
-  }
-  return tinted;
+function put(x, y, g, r, gg, b) {
+  x = Math.floor(x); y = Math.floor(y);
+  if (x < 0 || y < 0 || x >= K.w || y >= K.h) return;
+  const i = (K.y + y) * cols + K.x + x;
+  if (flag[i] === 2) return;                                        // never punch a hole in something solid
+  flag[i] = 1; glyph[i] = g; colour[i] = pack(r, gg, b);
 }
-const tinted = [0, 0, 0];          // scratch result, reused for every cell
-
-// The flat patch colour at a point on the body, before any gradient.
-function patchColour(f, s, dl) {
-  const n = noise2(s * 5.5, dl * 14, f.seed);
-  switch (f.variety) {
-    case "kohaku":
-      return n > 0.52 ? RED : WHITE;
-    case "sanke":
-      if (s > 0.15 && noise2(s * 14, dl * 30, f.seed + 7) > 0.72) return SUMI;
-      return n > 0.54 ? RED : WHITE;
-    case "showa":
-      if (noise2(s * 5, dl * 12, f.seed + 4) > 0.55) return SUMI;
-      return n > 0.5 ? RED : WHITE;
-    case "pike":
-      if (Math.abs(dl) < 0.012 || s < 0.1) return PIKE_DARK;         // dark back and snout
-      return noise2(s * 16, dl * 60, f.seed) > 0.6 ? PIKE_SPOT : PIKE;
-    case "ogon":
-      return GOLD;
-    default:
-      return n > 0.7 ? WHITE : ORANGE;
-  }
+function blk(x, y, r, g, b) {
+  x = Math.floor(x); y = Math.floor(y);
+  if (x < 0 || y < 0 || x >= K.w || y >= K.h) return;
+  const i = (K.y + y) * cols + K.x + x;
+  flag[i] = 2; fill[i] = pack(r, g, b);
+  glyph[i] = TEX.charCodeAt((hash(x, y, 5) * TEX.length) | 0);
+  colour[i] = pack(r * 0.62, g * 0.62, b * 0.62);
+}
+// a filled circle; cells are half again as tall as they are wide. fn(u, v, x, y) gives the colour
+function disc(cx, cy, rad, fn) {
+  const y0 = Math.max(0, Math.floor(cy - rad / 1.5)), y1 = Math.min(K.h - 1, Math.ceil(cy + rad / 1.5));
+  const x0 = Math.max(0, Math.floor(cx - rad)), x1 = Math.min(K.w - 1, Math.ceil(cx + rad));
+  for (let y = y0; y <= y1; y++)
+    for (let x = x0; x <= x1; x++) {
+      const dx = x + 0.5 - cx, dy = (y + 0.5 - cy) * 1.5;
+      if (dx * dx + dy * dy > rad * rad) continue;
+      const c = fn(dx / rad, dy / rad, x, y);
+      if (c) blk(x, y, c[0], c[1], c[2]);
+    }
+}
+function stars(seed, density) {
+  for (let y = 0; y < K.h; y++)
+    for (let x = 0; x < K.w; x++) {
+      const s = hash(x, y, seed);
+      if (s > density) continue;
+      const k = 0.55 + 0.45 * Math.sin(time * (1 + s * 300) + x);
+      put(x, y, s < density * 0.3 ? 43 : 46, 150 * k, 160 * k, 190 * k);
+    }
 }
 
-// Half-width of the body (in body lengths) at position s along it.
-function bodyWidth(s) {
-  if (s < 0.12) {
-    const k = 1 - s / 0.12;
-    return 0.13 * Math.sqrt(Math.max(0, 1 - k * k));
-  }
-  const t = (s - 0.12) / 0.68;
-  return 0.024 + 0.106 * (1 - Math.pow(t, 1.7));
-}
-
-// A line drawn at this angle looks most like which character?
-function dirGlyph(a) {
-  a = ((a % Math.PI) + Math.PI) % Math.PI;
-  if (a < Math.PI / 8 || a >= (7 * Math.PI) / 8) return 45;   // -
-  if (a < (3 * Math.PI) / 8) return 92;                        // \
-  if (a < (5 * Math.PI) / 8) return 124;                       // |
-  return 47;                                                   // /
-}
-
-// ---------- simulation (continuous space, no grid involved) ----------
-const K = 16;                      // spine points per fish
-let W = 0, H = 0, time = 0;
-let fish = [];
-
-const FLOW = -0.1;                 // direction the flock swims, in radians (0 = left to right)
-const flowX = Math.cos(FLOW), flowY = Math.sin(FLOW);
-
-// How far the screen reaches from its centre, along the flow and across it.
-const reachAlong = () => (Math.abs(flowX) * W + Math.abs(flowY) * H) / 2;
-const reachAcross = () => (Math.abs(flowY) * W + Math.abs(flowX) * H) / 2;
-
-// Put a fish `along` px from the screen centre (measured along the flow), at a
-// random spot across the stream, facing downstream with its body straight.
-function place(f, along) {
-  const across = (Math.random() * 2 - 1) * reachAcross() * 0.85;
-  f.x = W / 2 + flowX * along - flowY * across;
-  f.y = H / 2 + flowY * along + flowX * across;
-  f.heading = FLOW + f.bias;
-  f.turn = 0;
-  f.reversed = false;
-  f.flipAt = time + 10 + Math.random() * 30;
-  const seg = f.L / (K - 1);
-  for (let k = 0; k < K; k++) {
-    f.px[k] = f.qx[k] = f.x - Math.cos(f.heading) * seg * k;
-    f.py[k] = f.qy[k] = f.y - Math.sin(f.heading) * seg * k;
-  }
-}
-
-// Length of the nearest (largest) fish, in px.
-const baseLength = () => clamp(Math.min(W, H) * 0.2, 80, 190) * 1.15;
-
-function makeFish(i, count) {
-  const depth = 0.33 + 0.67 * Math.pow(Math.random(), 1.3);    // more far fish than near ones
-  const L = baseLength() * depth;
-  const f = {
-    seed: 1 + ((Math.random() * 1e6) | 0),
-    variety: VARIETIES[i % VARIETIES.length],
-    depth, L,
-    girth: 1, wag: 0.075,                              // body width and tail swing, relative to a koi
-    x: 0, y: 0, heading: 0, turn: 0,
-    bias: (Math.random() - 0.5) * 0.3,                  // each fish holds a slightly different course
-    reversed: false, flipAt: 0,
-    speed: 80 * (0.55 + 0.45 * depth),                 // px per second; near fish are faster
-    phase: Math.random() * TAU,
-    px: new Float32Array(K), py: new Float32Array(K),   // spine dragged behind the head
-    qx: new Float32Array(K), qy: new Float32Array(K),   // spine with the swimming wave added
-  };
-  place(f, reachAlong() * (((i + Math.random()) / count) * 2 - 1));   // spread along the stream
-  return f;
-}
-
-function step(dt) {
-  time += dt;
-  for (const f of fish) {
-    const along = (f.x - W / 2) * flowX + (f.y - H / 2) * flowY;
-    const across = (f.y - H / 2) * flowX - (f.x - W / 2) * flowY;
-
-    // fully off-screen: come back in at the upstream edge as a new fish
-    const far = reachAlong() + f.L * 1.15;
-    if (along > far || along < -far - f.L * 0.3 || Math.abs(across) > reachAcross() + f.L * 1.15) {
-      f.seed = 1 + ((Math.random() * 1e6) | 0);
-      f.variety = VARIETIES[(Math.random() * VARIETIES.length) | 0];
-      f.bias = (Math.random() - 0.5) * 0.3;
-      place(f, -reachAlong() - f.L * 0.05);
-      continue;
-    }
-
-    // now and then a fish turns around, swims upstream a while, then turns back
-    if (time > f.flipAt) {
-      if (f.reversed) { f.reversed = false; f.flipAt = time + 12 + Math.random() * 30; }
-      else if (Math.abs(along) < reachAlong() * 0.6) { f.reversed = true; f.flipAt = time + 5 + Math.random() * 4; }
-      else f.flipAt = time + 3;
-    }
-
-    // hold the flock's course, with a slow personal meander
-    const want = FLOW + f.bias + 0.22 * Math.sin(time * 0.3 + f.seed) + (f.reversed ? Math.PI : 0);
-    let turn = clamp(angleDiff(want, f.heading) * 1.2, -1, 1);
-
-    // give way to fish swimming at a similar depth
-    for (const o of fish) {
-      if (o === f || Math.abs(f.depth - o.depth) > 0.2) continue;
-      const dx = f.x - o.x, dy = f.y - o.y;
-      const dist = Math.hypot(dx, dy), r = (f.L + o.L) * 0.45;
-      if (dist < r) turn += clamp(angleDiff(Math.atan2(dy, dx), f.heading), -1, 1) * (1 - dist / r) * 0.8;
-    }
-
-    // scatter from the predator: turn away hard and sprint, more so the closer it is
-    let panic = 0;
-    if (predator) {
-      const dx = f.x - predator.x, dy = f.y - predator.y, d = Math.hypot(dx, dy);
-      if (d < FEAR) {
-        panic = 1 - d / FEAR;
-        turn = lerp(turn, clamp(angleDiff(Math.atan2(dy, dx), f.heading) * 3, -2.6, 2.6), Math.min(1, panic * 2));
-      }
-    }
-
-    const lim = 1.1 + 1.5 * panic;
-    f.turn += (clamp(turn, -lim, lim) - f.turn) * Math.min(1, dt * (2 + 5 * panic));
-    f.heading += f.turn * dt;
-    const sp = f.speed * (0.7 + 0.6 * noise1(time * 0.2 + f.seed * 0.051, f.seed + 1)) * (1 + 1.8 * panic);
-    advance(f, sp, dt);
-  }
-  stepPredator(dt);
-}
-
-// Move a fish forward at speed sp and update its spine.
-function advance(f, sp, dt) {
-  f.x += Math.cos(f.heading) * sp * dt;
-  f.y += Math.sin(f.heading) * sp * dt;
-  f.phase += dt * (2 + sp / 25);
-
-  // the body follows the head like a chain, so turns bend it naturally
-  const seg = f.L / (K - 1);
-  f.px[0] = f.x; f.py[0] = f.y;
-  let prev = f.heading + Math.PI;
-  for (let k = 1; k < K; k++) {
-    let a = Math.atan2(f.py[k] - f.py[k - 1], f.px[k] - f.px[k - 1]);
-    a = prev + clamp(angleDiff(a, prev), -0.2, 0.2);            // a spine can only bend so far per joint
-    f.px[k] = f.px[k - 1] + Math.cos(a) * seg;
-    f.py[k] = f.py[k - 1] + Math.sin(a) * seg;
-    prev = a;
-  }
-
-  // swimming wave: a sideways ripple that grows toward the tail
-  for (let k = 0; k < K; k++) {
-    const a = Math.max(0, k - 1), b = Math.min(K - 1, k + 1);
-    let tx = f.px[b] - f.px[a], ty = f.py[b] - f.py[a];
-    const d = Math.hypot(tx, ty) || 1;
-    const s = k / (K - 1);
-    const wave = Math.sin(f.phase - s * 5.2) * f.L * f.wag * (0.1 + 0.9 * Math.pow(s, 1.3));
-    f.qx[k] = f.px[k] + (-ty / d) * wave;
-    f.qy[k] = f.py[k] + (tx / d) * wave;
-  }
-
-  renderer.shed(f.qx[K - 1], f.qy[K - 1], dt * 4 * f.depth);
-}
-
-// ---------- predator ----------
-const FEAR = 230;                  // koi closer than this to the pike scatter
-let predator = null;
-// time of its next visit, in seconds (add ?predator to the URL to see it straight away)
-let predatorAt = typeof location !== "undefined" && location.search.includes("predator") ? 0 : 10 + Math.random() * 12;
-
-function spawnPredator() {
-  const L = baseLength() * 1.7;
-  const from = Math.random() * TAU;                              // side it arrives from
-  const edge = Math.min(W / 2 / (Math.abs(Math.cos(from)) || 1e-6), H / 2 / (Math.abs(Math.sin(from)) || 1e-6));
-  const p = {
-    seed: 1 + ((Math.random() * 1e6) | 0),
-    variety: "pike", depth: 1, L, girth: 0.6, wag: 0.05,
-    x: W / 2 + Math.cos(from) * (edge + L * 0.1),
-    y: H / 2 + Math.sin(from) * (edge + L * 0.1),
-    heading: from + Math.PI, turn: 0, phase: 0,
-    prey: null, retargetAt: 0, exit: null,
-    leaveAt: time + 14 + Math.random() * 8,
-    px: new Float32Array(K), py: new Float32Array(K),
-    qx: new Float32Array(K), qy: new Float32Array(K),
-  };
-  const seg = L / (K - 1);
-  for (let k = 0; k < K; k++) {
-    p.px[k] = p.qx[k] = p.x - Math.cos(p.heading) * seg * k;
-    p.py[k] = p.qy[k] = p.y - Math.sin(p.heading) * seg * k;
-  }
-  return p;
-}
-
-function stepPredator(dt) {
-  if (!predator) {
-    if (time > predatorAt) predator = spawnPredator();
-    return;
-  }
-  const p = predator;
-  let want, sp;
-  if (time > p.leaveAt) {
-    // done hunting: head straight out the nearest way and vanish once off-screen
-    if (p.exit === null) p.exit = Math.atan2(p.y - H / 2, p.x - W / 2);
-    want = p.exit; sp = 140;
-    const m = p.L * 1.2;
-    if (p.x < -m || p.x > W + m || p.y < -m || p.y > H + m) {
-      predator = null;
-      predatorAt = time + 30 + Math.random() * 40;
-      return;
-    }
-  } else {
-    // chase the nearest koi on screen, picking again every few seconds
-    const seen = (f) => f.x > 0 && f.x < W && f.y > 0 && f.y < H;
-    if (!p.prey || time > p.retargetAt || !seen(p.prey)) {
-      let best = Infinity;
-      p.prey = null;
-      for (const f of fish) {
-        const d = Math.hypot(f.x - p.x, f.y - p.y);
-        if (seen(f) && d < best) { best = d; p.prey = f; }
-      }
-      p.retargetAt = time + 3 + Math.random() * 3;
-    }
-    const tx = p.prey ? p.prey.px[5] : W / 2, ty = p.prey ? p.prey.py[5] : H / 2;
-    want = Math.atan2(ty - p.y, tx - p.x);
-    sp = 120 + 60 * clamp(1 - Math.hypot(tx - p.x, ty - p.y) / 400, 0, 1);   // lunges when close
-  }
-  p.turn += (clamp(angleDiff(want, p.heading) * 2.5, -1.8, 1.8) - p.turn) * Math.min(1, dt * 4);
-  p.heading += p.turn * dt;
-  advance(p, sp, dt);
-}
-
-// ---------- plants ----------
-const PAD = [52, 118, 76];
-const PETAL = [238, 150, 184];
-const STAMEN = [244, 204, 92];
-const WEED = [58, 140, 104];
-const pads = [], weeds = [];
-
-function makePlants() {
-  const area = W * H;
-
-  // lily pads float on top, gathered in clusters near the banks
-  const clusters = clamp(Math.round(area / 300000), 2, 6);
-  for (let c = 0; c < clusters; c++) {
-    let cx = Math.random(), cy = Math.random() < 0.5 ? 0.05 + Math.random() * 0.15 : 0.8 + Math.random() * 0.15;
-    if (Math.random() < 0.3) { cy = Math.random(); cx = Math.random() < 0.5 ? 0.03 + Math.random() * 0.1 : 0.87 + Math.random() * 0.1; }
-    const n = 3 + ((Math.random() * 4) | 0);
-    for (let i = 0; i < n; i++) {
-      const a = Math.random() * TAU, d = Math.sqrt(Math.random()) * 105;
-      pads.push({
-        fx: cx, fy: cy, ox: Math.cos(a) * d * 1.5, oy: Math.sin(a) * d * 0.8,
-        r: 20 + Math.random() * 30, rot: Math.random() * TAU, ph: Math.random() * TAU,
-        tint: 0.8 + Math.random() * 0.35, flower: Math.random() < 0.3,
-      });
-    }
-  }
-
-  // weeds grow from the bottom, under the fish, and trail in the current
-  const clumps = clamp(Math.round(area / 200000), 3, 8);
-  for (let c = 0; c < clumps; c++) {
-    const fx = 0.08 + Math.random() * 0.84, fy = 0.1 + Math.random() * 0.8;
-    const n = 6 + ((Math.random() * 5) | 0);
-    for (let i = 0; i < n; i++) {
-      weeds.push({
-        fx, fy, ox: (Math.random() - 0.5) * 36, oy: (Math.random() - 0.5) * 28,
-        len: 45 + Math.random() * 95, ang: FLOW + (Math.random() - 0.5) * 1.3,
-        ph: Math.random() * TAU, shade: 0.7 + Math.random() * 0.5,
-      });
-    }
-  }
-}
-
-// ---------- renderer (everything snaps to the character grid here) ----------
-const renderer = {
-  canvas: null, ctx: null, bg: null, dpr: 1,
-  cw: 10, ch: 15, cols: 0, rows: 0, font: "monospace",
-  flag: new Uint8Array(0), glyph: new Uint16Array(0),
-  colour: new Uint32Array(0), fill: new Uint32Array(0),
-  energy: new Float32Array(0), energyTmp: new Float32Array(0),
-  shallow: new Float32Array(0),
-  lightCanvas: null, lightCtx: null, lightImg: null, lightAt: -1,
-  back: null, backCtx: null, trig: new Float32Array(0),
-
-  resize(w, h, dpr) {
-    this.dpr = dpr;
-    this.cw = clamp(Math.round(w / 260), 4, 8);
-    this.ch = Math.round(this.cw * 1.5);
-    this.cols = Math.ceil(w / this.cw);
-    this.rows = Math.ceil(h / this.ch);
-    const n = this.cols * this.rows;
-    this.flag = new Uint8Array(n); this.glyph = new Uint16Array(n);
-    this.colour = new Uint32Array(n); this.fill = new Uint32Array(n);
-    this.energy = new Float32Array(n); this.energyTmp = new Float32Array(n);
-    this.shallow = new Float32Array(n);
-    this.lightCanvas = document.createElement("canvas");
-    this.lightCanvas.width = this.cols; this.lightCanvas.height = this.rows;
-    this.lightCtx = this.lightCanvas.getContext("2d");
-    this.lightImg = this.lightCtx.createImageData(this.cols, this.rows);
-    for (let i = 0; i < n; i++) this.lightImg.data.set(LIGHT, i * 4);
-    this.lightAt = -1;
-    this.trig = new Float32Array(this.cols * 4);
-    this.back = document.createElement("canvas");
-    this.back.width = Math.round(w * dpr); this.back.height = Math.round(h * dpr);
-    this.backCtx = this.back.getContext("2d", { alpha: false });
-    this.canvas.width = Math.round(w * dpr);
-    this.canvas.height = Math.round(h * dpr);
-
-    // static backdrop: water, pond floor and the cell grid
-    this.bg.width = this.canvas.width; this.bg.height = this.canvas.height;
-    const b = this.bg.getContext("2d");
-    b.setTransform(dpr, 0, 0, dpr, 0, 0);
-    b.fillStyle = `rgb(${BG})`;
-    b.fillRect(0, 0, w, h);
-
-    // pond floor: smooth noise decides how shallow each cell is, then the water
-    // is tinted in steps, like the contour bands of a depth chart
-    const { cw, ch, cols, rows } = this;
-    const bands = [];
-    for (let k = 0; k <= BANDS; k++) {
-      const t = k / BANDS;
-      bands.push(`rgb(${Math.round(lerp(BG[0], SHALLOW[0], t))},${Math.round(lerp(BG[1], SHALLOW[1], t))},${Math.round(lerp(BG[2], SHALLOW[2], t))})`);
-    }
-    for (let r = 0; r < rows; r++)
-      for (let c = 0; c < cols; c++) {
-        const x = (c + 0.5) * cw, y = (r + 0.5) * ch;
-        const v = noise2(x / 320, y / 320, POND) * 0.65 + noise2(x / 120, y / 120, POND + 1) * 0.35;
-        const sh = smooth(clamp((v - 0.32) / 0.38, 0, 1));
-        this.shallow[r * cols + c] = sh;
-        const band = Math.round(sh * BANDS + (hash(c, r, POND) - 0.5) * 0.5);   // dithered edges
-        if (band > 0) {
-          b.fillStyle = bands[Math.min(BANDS, band)];
-          b.fillRect(c * cw, r * ch, cw, ch);
-        }
-      }
-
-    // pebbles on the floor, visible only where the water is shallow
-    b.font = `600 ${Math.round(ch * 0.78)}px ${this.font}`;
-    b.textAlign = "center";
-    b.textBaseline = "middle";
-    for (let r = 0; r < rows; r++)
-      for (let c = 0; c < cols; c++) {
-        const sh = this.shallow[r * cols + c];
-        const h1 = hash(c, r, POND + 2);
-        if (sh < 0.45 || h1 > 0.05 * sh) continue;
-        b.fillStyle = `rgba(170,190,180,${(0.1 + 0.16 * sh).toFixed(3)})`;
-        b.fillText("o.:,"[(h1 * 4000) & 3], c * cw + cw / 2, r * ch + ch / 2);
-      }
-
-    // cell borders: hairlines one device pixel wide on every cell boundary
-    b.setTransform(1, 0, 0, 1, 0, 0);
-    b.strokeStyle = GRID;
-    b.lineWidth = 1;
-    b.beginPath();
-    for (let c = 0; c <= this.cols; c++) {
-      const x = Math.round(c * this.cw * dpr) + 0.5;
-      b.moveTo(x, 0); b.lineTo(x, h * dpr);
-    }
-    for (let r = 0; r <= this.rows; r++) {
-      const y = Math.round(r * this.ch * dpr) + 0.5;
-      b.moveTo(0, y); b.lineTo(w * dpr, y);
-    }
-    b.stroke();
-  },
-
-  cellIndex(x, y) {
-    const c = Math.floor(x / this.cw), r = Math.floor(y / this.ch);
-    return c < 0 || r < 0 || c >= this.cols || r >= this.rows ? -1 : r * this.cols + c;
-  },
-
-  shed(x, y, amount) {
-    const i = this.cellIndex(x, y);
-    if (i >= 0) this.energy[i] = Math.min(1.5, this.energy[i] + amount);
-  },
-
-  // wake: blur and fade the energy grid a little every frame
-  diffuse(dt) {
-    const { cols, rows, energy: e, energyTmp: o } = this;
-    const decay = Math.exp(-dt * 0.9);
-    const spread = Math.min(0.5, dt * 2.5);                       // slow blur, so the wake lingers
-    for (let r = 0; r < rows; r++)
-      for (let c = 0; c < cols; c++) {
-        const i = r * cols + c;
-        const l = c > 0 ? e[i - 1] : e[i], rt = c < cols - 1 ? e[i + 1] : e[i];
-        const u = r > 0 ? e[i - cols] : e[i], d = r < rows - 1 ? e[i + cols] : e[i];
-        o[i] = (e[i] + ((l + rt + u + d) * 0.25 - e[i]) * spread) * decay;
-      }
-    this.energy = o; this.energyTmp = e;
-  },
-
-  // extra pushes the colour further toward the water, for translucent parts
-  fog(c, k, depth, extra = 0) {
-    const t = Math.min(1, extra + (1 - depth) * FOG * (1 - extra));
-    return pack(lerp(c[0] * k, BG[0], t), lerp(c[1] * k, BG[1], t), lerp(c[2] * k, BG[2], t));
-  },
-
-  // Rasterize one fish: for every grid cell near it, find where that cell sits
-  // in body coordinates (s along the spine, d sideways) and decide what it is.
-  drawFish(f) {
-    const { cw, ch, cols, rows } = this;
-    const { qx, qy, L } = f;
-    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    for (let k = 0; k < K; k++) {
-      x0 = Math.min(x0, qx[k]); x1 = Math.max(x1, qx[k]);
-      y0 = Math.min(y0, qy[k]); y1 = Math.max(y1, qy[k]);
-    }
-    const pad = L * 0.24;
-    const c0 = Math.max(0, Math.floor((x0 - pad) / cw)), c1 = Math.min(cols - 1, Math.floor((x1 + pad) / cw));
-    const r0 = Math.max(0, Math.floor((y0 - pad) / ch)), r1 = Math.min(rows - 1, Math.floor((y1 + pad) / ch));
-    const finFlap = 1 + 0.18 * Math.sin(f.phase * 0.5);
-
-    for (let r = r0; r <= r1; r++) {
-      for (let c = c0; c <= c1; c++) {
-        const x = c * cw + cw / 2, y = r * ch + ch / 2;
-
-        // nearest point on the spine
-        let best = Infinity, bs = 0, bd = 0, bang = 0, ok = true;
-        for (let k = 0; k < K - 1; k++) {
-          const ax = qx[k], ay = qy[k], dx = qx[k + 1] - ax, dy = qy[k + 1] - ay;
-          const len2 = dx * dx + dy * dy || 1;
-          const tr = ((x - ax) * dx + (y - ay) * dy) / len2;
-          const t = clamp(tr, 0, 1);
-          const ex = x - (ax + dx * t), ey = y - (ay + dy * t);
-          const dist2 = ex * ex + ey * ey;
-          if (dist2 < best) {
-            best = dist2;
-            bs = (k + t) / (K - 1);
-            bd = (dx * (y - ay) - dy * (x - ax)) / Math.sqrt(len2);
-            bang = Math.atan2(dy, dx);
-            ok = !((k === 0 && tr < 0) || (k === K - 2 && tr > 1));   // past the nose or tail tip
-          }
-        }
-        if (!ok) continue;
-
-        const s = bs, dl = bd / L, ad = Math.abs(dl);
-        const i = r * cols + c;
-
-        if (s < 0.8 && ad <= f.girth * bodyWidth(s)) {
-          // body: brightness picks the character, darker toward the flanks
-          const col = bodyColour(f, s, dl);
-          const edge = ad / f.girth * bodyWidth(s);
-          const shade = 1 - 0.5 * edge * edge;
-          const lum = ((0.3 * col[0] + 0.59 * col[1] + 0.11 * col[2]) / 255) * shade;
-          const jitter = Math.floor(hash(Math.round((s * L) / cw), Math.round((dl * L) / cw), f.seed) * 3) - 1;
-          const tone = this.fog(col, 0.62 + 0.38 * shade, f.depth);
-          this.flag[i] = 1;
-          if ((f.girth * bodyWidth(s) - ad) * L < cw * 0.3) {
-            // rim cell, only partly covered: a bare character, no block behind it
-            this.fill[i] = 0;
-            this.glyph[i] = RAMP.charCodeAt(clamp(Math.floor(lum * RAMP.length) + jitter, 0, RAMP.length - 1));
-            this.colour[i] = tone;
-          } else {
-            // solid cell: coloured block, with the character printed on it in a
-            // darker shade of the same colour (lighter on the black patches)
-            const r = tone >>> 16, g = (tone >>> 8) & 255, b = tone & 255;
-            this.fill[i] = tone || 1;
-            this.glyph[i] = RAMP.charCodeAt(clamp(Math.floor((1 - lum) * RAMP.length) + jitter, 0, RAMP.length - 1));
-            this.colour[i] = col === SUMI ? pack(r * 1.7 + 34, g * 1.7 + 30, b * 1.7 + 30) : pack(r * 0.42, g * 0.42, b * 0.42);
-          }
-          continue;
-        }
-
-        if (s >= 0.8) {
-          // tail fin: fans out, with a notch cut into the trailing edge
-          const u = (s - 0.8) / 0.2;
-          const w = 0.024 + 0.11 * Math.pow(u, 0.8);
-          const notch = 0.085 * Math.max(0, (u - 0.55) / 0.45);
-          if (ad <= w && ad >= notch) {
-            const col = bodyColour(f, 0.78, 0);
-            const fin = [lerp(col[0], 255, 0.35), lerp(col[1], 255, 0.35), lerp(col[2], 255, 0.35)];
-            this.flag[i] = 1;
-            this.fill[i] = this.fog(fin, 1, f.depth, FIN_TINT) || 1; // faint tint, mostly water
-            this.glyph[i] = dirGlyph(bang + dl * 4);               // rays splay outward
-            this.colour[i] = this.fog(fin, 0.8 - 0.35 * u, f.depth);
-          }
-          continue;
-        }
-
-        // pectoral fins: a swept ellipse on each side behind the head
-        const e1 = (s - 0.27) / 0.085;
-        const e2 = (ad - 0.125 * f.girth - 0.45 * (s - 0.2)) / (0.05 * finFlap);
-        if (e1 * e1 + e2 * e2 < 1) {
-          const col = bodyColour(f, 0.2, 0);
-          const fin = [lerp(col[0], 255, 0.3), lerp(col[1], 255, 0.3), lerp(col[2], 255, 0.3)];
-          this.flag[i] = 1;
-          this.fill[i] = this.fog(fin, 1, f.depth, FIN_TINT) || 1;
-          this.glyph[i] = dirGlyph(bang + Math.sign(dl) * 1.0);
-          this.colour[i] = this.fog(fin, 0.75, f.depth);
-        }
-      }
-    }
-
-    // eyes: stamped as a filled cell so the dark dot reads against the head
-    if (f.girth * bodyWidth(0.08) * L * 2 >= cw * 2.5) {
-      const dx = qx[2] - qx[0], dy = qy[2] - qy[0], d = Math.hypot(dx, dy) || 1;
-      const hx = qx[0] + (dx / d) * L * 0.085, hy = qy[0] + (dy / d) * L * 0.085;
-      const off = f.girth * bodyWidth(0.085) * L * 0.62;
-      for (const side of [-1, 1]) {
-        const i = this.cellIndex(hx + (-dy / d) * off * side, hy + (dx / d) * off * side);
-        if (i < 0) continue;
-        this.flag[i] = 1;
-        this.fill[i] = this.fog(bodyColour(f, 0.085, 0), 0.8, f.depth) || 1;
-        this.glyph[i] = 0x25cf;                                    // ●
-        this.colour[i] = this.fog(EYE, 1, f.depth);
-      }
-    }
-  },
-
-  // Sunlight on the floor: two sets of bent waves drift across each other, and
-  // cells near where they cancel light up. Brighter where the water is shallow.
-  // Kept as a tiny image with one pixel per cell and merged into the backdrop
-  // only a few times a second, so each frame pays for a single plain copy.
-drawBackdrop() {
-    const { cw, ch, cols, rows, dpr, shallow } = this;
-    if (time - this.lightAt >= LIGHT_EVERY || time < this.lightAt) {
-      this.lightAt = time;
-      const t = time, px = this.lightImg.data, tr = this.trig;
-      // Both waves split into a per-column part and a per-row part, so the trig
-      // is done once per column and once per row instead of once per cell.
-      for (let c = 0; c < cols; c++) {
-        const x = c * cw, a = x * 0.017 + t * 0.45, b = 2 * Math.sin(x * 0.011 - t * 0.23);
-        tr[c * 4] = Math.sin(a); tr[c * 4 + 1] = Math.cos(a);
-        tr[c * 4 + 2] = Math.sin(b); tr[c * 4 + 3] = Math.cos(b);
-      }
-      for (let r = 0; r < rows; r++) {
-        const y = r * ch;
-        const wy = Math.sin(y * 0.013 + t * 0.31) * 2, by = y * 0.021 - t * 0.37;
-        const sw = Math.sin(wy), cwy = Math.cos(wy), sb = Math.sin(by), cb = Math.cos(by);
-        for (let c = 0; c < cols; c++) {
-          const i = r * cols + c, j = c * 4;
-          const v = tr[j] * cwy + tr[j + 1] * sw + sb * tr[j + 3] + cb * tr[j + 2];
-          const line = 1 - Math.abs(v) * 2.2;                      // thin bright ridges
-          const k = line > 0 ? line * (0.25 + 0.75 * shallow[i]) : 0;
-          px[i * 4 + 3] = k > 0.16 ? Math.round(k * 26) : 0;       // alpha only; colour is preset
-        }
-      }
-      this.lightCtx.putImageData(this.lightImg, 0, 0);
-
-      // rebuild the backdrop: static floor and grid, with the light scaled up over it
-      const b = this.backCtx;
-      b.drawImage(this.bg, 0, 0);
-      b.imageSmoothingEnabled = false;                             // keep one hard-edged block per cell
-      b.drawImage(this.lightCanvas, 0, 0, cols * cw * dpr, rows * ch * dpr);
-    }
-    this.ctx.drawImage(this.back, 0, 0);
-  },
-
-  // Weeds: each strand is a chain of short segments whose bend ripples from
-  // root to tip, drawn as bare direction characters.
-  drawWeeds() {
-    const { cw } = this;
-    const N = 12;
-    for (const w of weeds) {
-      let x = w.fx * W + w.ox, y = w.fy * H + w.oy;
-      const seg = w.len / N;
-      const steps = Math.max(1, Math.ceil(seg / (cw * 0.5)));
-      for (let k = 0; k < N; k++) {
-        const t = (k + 1) / N;
-        const a = w.ang + (0.55 * Math.sin(time * 0.9 + w.ph - t * 3.2) + 0.25 * Math.sin(time * 0.37 + w.ph * 2)) * t;
-        const nx = x + Math.cos(a) * seg, ny = y + Math.sin(a) * seg;
-        const fade = 0.12 + 0.3 * t;                               // deep, so mostly water colour
-        const col = pack(lerp(WEED[0] * w.shade, BG[0], fade), lerp(WEED[1] * w.shade, BG[1], fade), lerp(WEED[2] * w.shade, BG[2], fade));
-        for (let j = 1; j <= steps; j++) {
-          const i = this.cellIndex(lerp(x, nx, j / steps), lerp(y, ny, j / steps));
-          if (i < 0) continue;
-          this.flag[i] = 1; this.fill[i] = 0;
-          this.glyph[i] = dirGlyph(a);
-          this.colour[i] = col;
-        }
-        x = nx; y = ny;
-      }
-    }
-  },
-
-  // Lily pads: a disc with a wedge cut out, veins radiating from the centre.
-  // They bob, drift a few pixels and slowly swivel.
-  drawPads() {
-    const { cw, ch, cols, rows } = this;
-    for (const p of pads) {
-      const x0 = p.fx * W + p.ox + Math.sin(time * 0.21 + p.ph) * 7;
-      const y0 = p.fy * H + p.oy + Math.cos(time * 0.17 + p.ph * 1.3) * 5;
-      const rot = p.rot + 0.3 * Math.sin(time * 0.13 + p.ph);
-      const R = p.r * (1 + 0.035 * Math.sin(time * 0.9 + p.ph));
-      const bloom = 0.42 + 0.04 * Math.sin(time * 0.6 + p.ph);
-      const c0 = Math.max(0, Math.floor((x0 - R) / cw)), c1 = Math.min(cols - 1, Math.floor((x0 + R) / cw));
-      const r0 = Math.max(0, Math.floor((y0 - R) / ch)), r1 = Math.min(rows - 1, Math.floor((y0 + R) / ch));
-      for (let r = r0; r <= r1; r++) {
-        for (let c = c0; c <= c1; c++) {
-          const dx = c * cw + cw / 2 - x0, dy = r * ch + ch / 2 - y0;
-          const d = Math.hypot(dx, dy);
-          if (d > R) continue;
-          const th = Math.atan2(dy, dx), rel = angleDiff(th, rot);
-          const i = r * cols + c;
-
-          if (p.flower) {
-            const fr = R * bloom * (0.72 + 0.28 * Math.cos(6 * rel));  // six petals
-            if (d < fr) {
-              const core = d < R * 0.12;
-              const col = core ? STAMEN : PETAL, k = core ? 1 : 0.72 + 0.28 * (d / (R * bloom));
-              this.flag[i] = 1;
-              this.fill[i] = pack(col[0] * k, col[1] * k, col[2] * k);
-              this.glyph[i] = core ? 64 : 42;                          // @ and *
-              this.colour[i] = pack(col[0] * k * 0.5, col[1] * k * 0.5, col[2] * k * 0.5);
-              continue;
-            }
-          }
-          if (Math.abs(rel) < 0.24 && d > R * 0.15) continue;          // the notch
-
-          const k = p.tint * (0.7 + 0.3 * (d / R));
-          const spoke = (((rel / (TAU / 10)) % 1) + 1) % 1;
-          const vein = Math.abs(spoke - 0.5) > 0.4 && d > R * 0.2;
-          const glyph = vein ? dirGlyph(th) : hash(Math.floor(d / cw), Math.floor(rel * 7), 5) < 0.5 ? 46 : 58;
-          this.flag[i] = 1;
-          this.glyph[i] = glyph;
-          if (R - d < cw * 0.55) {
-            this.fill[i] = 0;                                          // rim: bare character
-            this.colour[i] = pack(PAD[0] * k, PAD[1] * k, PAD[2] * k);
-          } else {
-            this.fill[i] = pack(PAD[0] * k, PAD[1] * k, PAD[2] * k);
-            const g = vein ? 0.62 : 0.45;
-            this.colour[i] = pack(PAD[0] * k * g, PAD[1] * k * g, PAD[2] * k * g);
-          }
-        }
-      }
-    }
-  },
-
-  render(dt) {
-    const { ctx, dpr, cols, cw, ch } = this;
-    this.diffuse(dt);
-    this.flag.fill(0);
-    this.drawWeeds();                                              // under the fish
-    for (const f of fish) this.drawFish(f);                        // fish are sorted far to near
-    if (predator) this.drawFish(predator);
-    this.drawPads();                                               // floating above them
-
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    this.drawBackdrop();
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    // wake dots
-    const dot = Math.max(2, Math.round(cw * 0.3));
-    const e = this.energy;
-    let lastStyle = "";
-    for (let i = 0; i < e.length; i++) {
-      if (e[i] < 0.06 || this.flag[i]) continue;
-      const c = i % cols, r = (i / cols) | 0;
-      const tw = 0.75 + 0.25 * Math.sin(time * 4 + hash(c, r, 3) * 40);
-      const style = WAKE_STYLES[Math.min(WAKE_STYLES.length - 1, (e[i] * tw * 1.8 * 8) | 0)];
-      if (style !== lastStyle) ctx.fillStyle = lastStyle = style;
-      ctx.fillRect(Math.round(c * cw + cw / 2 - dot / 2), Math.round(r * ch + ch / 2 - dot / 2), dot, dot);
-    }
-
-    // one character per occupied cell
-    ctx.font = `600 ${Math.round(ch * 0.78)}px ${this.font}`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    for (let i = 0; i < this.flag.length; i++) {
-      if (!this.flag[i]) continue;
-      const x = (i % cols) * cw, y = ((i / cols) | 0) * ch;
-      if (this.fill[i]) {
-        const fs = css(this.fill[i]);
-        if (fs !== lastStyle) ctx.fillStyle = lastStyle = fs;
-        ctx.fillRect(x + 1, y + 1, cw - 1, ch - 1);
-      }
-      const gs = css(this.colour[i]);
-      if (gs !== lastStyle) ctx.fillStyle = lastStyle = gs;
-      ctx.fillText(String.fromCharCode(this.glyph[i]), x + cw / 2, y + ch / 2 + ch * 0.06);
-    }
-  },
+// ---------- block lettering ----------
+const FONT = {
+  A: ["111", "101", "111", "101", "101"], B: ["110", "101", "110", "101", "110"],
+  C: ["111", "100", "100", "100", "111"], D: ["110", "101", "101", "101", "110"],
+  E: ["111", "100", "110", "100", "111"], F: ["111", "100", "110", "100", "100"],
+  G: ["111", "100", "101", "101", "111"], H: ["101", "101", "111", "101", "101"],
+  I: ["111", "010", "010", "010", "111"], K: ["101", "101", "110", "101", "101"],
+  L: ["100", "100", "100", "100", "111"], N: ["1001", "1101", "1011", "1001", "1001"],
+  O: ["111", "101", "101", "101", "111"], P: ["111", "101", "111", "100", "100"],
+  R: ["110", "101", "110", "101", "101"], S: ["111", "100", "111", "001", "111"],
+  T: ["111", "010", "010", "010", "010"], W: ["10001", "10001", "10101", "10101", "01010"],
+  " ": ["00", "00", "00", "00", "00"],
 };
+function textWidth(str, sx) {
+  let n = -1;
+  for (const c of str) n += FONT[c][0].length + 1;
+  return n * sx;
+}
+function text(str, x, y, sx, sy, r, g, b) {
+  for (const c of str) {
+    const f = FONT[c];
+    for (let j = 0; j < 5; j++)
+      for (let i = 0; i < f[j].length; i++)
+        if (f[j][i] === "1")
+          for (let b2 = 0; b2 < sy; b2++)
+            for (let a = 0; a < sx; a++) blk(x + i * sx + a, y + j * sy + b2, r, g, b);
+    x += (f[0].length + 1) * sx;
+  }
+}
+
+// ---------- the four little scenes ----------
+const FISH = [
+  { c: [240, 122, 40], p: [246, 240, 228], ph: 0 },
+  { c: [244, 240, 230], p: [214, 60, 44], ph: 9.3 },
+  { c: [236, 176, 60], p: [240, 122, 40], ph: 21.7 },
+];
+const PROFILE = [0.55, 0.85, 1, 1, 0.9, 0.75, 0.58, 0.42, 0.3, 0.55];
+const PADS = [[0.15, 0.27, 0.17, 0.6], [0.84, 0.72, 0.2, 2.4], [0.7, 0.18, 0.12, 4.1], [0.3, 0.83, 0.13, 5.2]];
+
+function koi(t) {
+  const { w, h } = K;
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const n = noise2(x * 0.07 + t * 0.06, y * 0.28 - t * 0.04, 11);
+      if (n > 0.6) { const k = (n - 0.6) * 2.5; put(x, y, n > 0.72 ? 126 : 45, 20 + 50 * k, 60 + 90 * k, 80 + 90 * k); }
+    }
+  const R = h * 0.1;
+  for (let f = 0; f < 3; f++) {
+    const F = FISH[f];
+    for (let k = 9; k >= 0; k--) {                                   // tail first, head on top
+      const s = t * 0.5 + F.ph - k * 0.24;
+      const px = w * (0.5 + 0.3 * Math.sin(s * 0.23 + f * 2.1) + 0.14 * Math.sin(s * 0.61 + f));
+      const py = h * (0.5 + 0.28 * Math.sin(s * 0.31 + f * 1.3) + 0.12 * Math.cos(s * 0.53 + f * 4));
+      let c = hash(k, f, 3) > 0.55 ? F.p : F.c;
+      if (k === 9) c = [lerp(c[0], 255, 0.4), lerp(c[1], 240, 0.4), lerp(c[2], 220, 0.4)];
+      disc(px, py, R * PROFILE[k], () => c);
+    }
+  }
+  for (const [fx, fy, fr, notch] of PADS)
+    disc(w * fx + Math.sin(t * 0.4 + notch) * 0.6, h * fy, h * fr, (u, v, x, y) => {
+      let a = Math.atan2(v, u) - notch;
+      a = Math.abs(a - TAU * Math.round(a / TAU));
+      const d = u * u + v * v;
+      if (a < 0.3 && d > 0.04) return null;
+      const k = (0.82 + 0.26 * hash(x, y, 12)) * (d > 0.7 ? 0.72 : 1);
+      return [44 * k, 124 * k, 72 * k];
+    });
+}
+
+function branch(t) {
+  const { w, h } = K, s = h / 29;
+  for (let y = 0; y < h * 0.6; y++)
+    for (let x = 0; x < w; x++) if (hash(x, y, 21) < 0.008) put(x, y, 46, 120, 130, 160);
+  disc(w * 0.82, h * 0.24, h * 0.2, (u, v, x, y) => {
+    const k = 0.9 + 0.1 * hash(x, y, 22) - (hash(x >> 1, y, 23) > 0.85 ? 0.12 : 0);
+    return [226 * k, 230 * k, 244 * k];
+  });
+  const far = (x) => h * (0.64 + 0.1 * noise1(x * 0.045, 24));
+  for (let x = 0; x < w; x++)
+    for (let y = Math.ceil(far(x)); y < h; y++) blk(x, y, 24, 34, 62);
+  for (let x = 0; x < w; x++) {                                      // firs along the far ridge
+    if (hash(x, 0, 26) > 0.16) continue;
+    const ht = Math.round((3 + hash(x, 1, 26) * 3) * s), top = Math.ceil(far(x)) - ht + 1;
+    for (let j = 0; j < ht; j++)
+      for (let i = -Math.round(j * 0.6); i <= Math.round(j * 0.6); i++) {
+        const k = 0.8 + 0.4 * hash(x + i, j, 29);
+        blk(x + i, top + j, 18 * k, 46 * k, 48 * k);
+      }
+  }
+  for (let x = 0; x < w; x++) {
+    const t2 = Math.ceil(h * (0.82 + 0.09 * noise1(x * 0.08 + 5, 25)));
+    for (let y = t2; y < h; y++) y === t2 ? blk(x, y, 168, 182, 214) : blk(x, y, 70, 84, 122);
+  }
+  // the branch, with snow lying along the top
+  const xEnd = Math.round(w * 0.8), top = [];
+  for (let x = 0; x <= xEnd; x++) {
+    const f = x / xEnd, yc = h * (0.56 - 0.14 * f) + Math.sin(x * 0.13) * 0.7 * s;
+    const th = lerp(2.8, 0.8, f) * s, y0 = Math.round(yc - th / 2), y1 = Math.max(y0, Math.round(yc + th / 2) - 1);
+    for (let y = y0; y <= y1; y++) { const k = 0.8 + 0.3 * hash(x, y, 27); blk(x, y, 96 * k, 66 * k, 50 * k); }
+    if (hash(x, 1, 27) > 0.12) blk(x, y0 - 1, 232, 238, 250);
+    top[x] = y0 - 1;
+  }
+  for (const [fx, n] of [[0.24, 6], [0.62, 5]]) {
+    const x0 = Math.round(w * fx), yb = top[x0];
+    for (let j = 1; j <= Math.round(n * s); j++) { blk(x0 + j, yb - j + 1, 84, 58, 44); blk(x0 + j, yb - j, 232, 238, 250); }
+  }
+  // a bullfinch that hops now and then
+  const bx = Math.round(w * 0.44), r = h * 0.15, ph = t % 6;
+  const lift = ph < 0.4 ? Math.sin(ph / 0.4 * Math.PI) * 1.5 : 0;
+  const cy = top[bx] - r / 1.5 + 0.6 - lift;
+  for (let j = 1; j <= 3; j++) blk(bx - r - j + 1, cy + j * 0.45, 30, 30, 40);
+  disc(bx, cy, r, (u, v) => (u + 0.5 * v > -0.15 ? [226, 84, 60] : [124, 134, 154]));
+  const hx = bx + 0.6 * r, hy = cy - 0.8 * r / 1.5;
+  disc(hx, hy, 0.62 * r, (u, v) => (v < 0.15 ? [28, 28, 36] : [226, 84, 60]));
+  blk(hx + 0.62 * r + 0.4, hy, 70, 70, 78);
+  for (let i = 0; i < 46; i++) {
+    const sp = 2 + hash(i, 0, 28) * 3;
+    const x = (hash(i, 1, 28) * w + Math.sin(t * 0.7 + i) * 1.5 + t * 1.2) % w;
+    put(x, (hash(i, 2, 28) * h + t * sp) % h, i % 3 ? 46 : 42, 220, 228, 245);
+  }
+}
+
+// a banded planet with rings; opts: centre, radius, ring tilt and squash, ring radii, colours
+function planet(t, cx, cy, Rp, T, sq, r0, r1, gap, ca, cb, cr) {
+  const { w, h } = K, cT = Math.cos(T), sT = Math.sin(T);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const dx = x + 0.5 - cx, dy = (y + 0.5 - cy) * 1.5, d2 = (dx * dx + dy * dy) / (Rp * Rp);
+      const ex = (dx * cT + dy * sT) / Rp, ey = (-dx * sT + dy * cT) / Rp, rr = Math.hypot(ex, ey / sq);
+      if (rr > r0 && rr < r1 && !(rr > gap && rr < gap + 0.09) && (ey > 0 || d2 > 1)) {
+        const k = 0.62 + 0.38 * noise1(rr * 9, 31);
+        blk(x, y, cr[0] * k, cr[1] * k, cr[2] * k);
+        continue;
+      }
+      if (d2 >= 1) continue;
+      const lam = Math.max(0, (dx * 0.55 - dy * 0.45) / Rp + Math.sqrt(1 - d2) * 0.7);
+      const band = clamp(noise1(ey * 7 + 20, 32) * 0.75 + 0.35 * noise2(ex * 3 + t * 0.05, ey * 14, 33) - 0.05, 0, 1);
+      const k = 0.07 + 1.05 * lam;
+      blk(x, y, lerp(ca[0], cb[0], band) * k, lerp(ca[1], cb[1], band) * k, lerp(ca[2], cb[2], band) * k);
+    }
+}
+
+function station(t) {
+  const { w, h } = K;
+  stars(41, 0.014);
+  planet(t, w * 0.3, h * 0.6, h * 0.5, -0.32, 0.3, 1.3, 2.25, 1.74, [222, 176, 112], [150, 94, 58], [206, 184, 148]);
+  const sx = Math.round(w * 0.76), sy = Math.round(h * 0.34), rw = h * 0.26, ry = rw * 0.5 / 1.5;
+  const rim = (near) => {
+    for (let i = 0; i < 40; i++) {
+      const a = i / 40 * TAU + t * 0.3, sn = Math.sin(a);
+      if ((sn >= 0) !== near) continue;
+      const k = near ? 1 : 0.6;
+      if (i % 8 === 0) blk(sx + 0.5 + Math.cos(a) * rw, sy + 0.5 + sn * ry, 255 * k, 200 * k, 110 * k);
+      else blk(sx + 0.5 + Math.cos(a) * rw, sy + 0.5 + sn * ry, 178 * k, 184 * k, 200 * k);
+    }
+  };
+  rim(false);
+  const arm = Math.round(h * 0.17);
+  for (let j = -arm; j <= arm; j++) blk(sx, sy + j, 150, 156, 170);
+  for (const e of [-arm - 1, arm + 1])
+    for (let i = -4; i <= 4; i++) if (i) blk(sx + i, sy + e, 44, 84 + 20 * (i & 1), 176);
+  for (let j = 0; j < 4; j++) {
+    const a = t * 0.3 + j * TAU / 4;
+    for (let q = 0.25; q < 0.9; q += 0.2) put(sx + 0.5 + Math.cos(a) * rw * q, sy + 0.5 + Math.sin(a) * ry * q, 43, 130, 136, 150);
+  }
+  rim(true);
+  blk(sx, sy, 236, 238, 244);
+}
+
+// a box seen from the front and a little above: lit top, mid front, dark side
+function box(x, yb, wd, ht, D, col, win) {
+  for (let k = D; k >= 0; k--)
+    for (let yy = 0; yy < ht; yy++)
+      for (let xx = 0; xx < wd; xx++) {
+        if (k > 0 && yy < ht - 1 && xx < wd - 2) continue;
+        const X = x + xx + 2 * k, Y = yb - yy - k;
+        if (k === 0 && win && yy % 2 === 1 && yy < ht - 1 && hash(X, Y, 43 + Math.floor(time / 20)) < win) { blk(X, Y, 255, 196, 104); continue; }
+        const tone = (k === 0 ? 0.6 : yy === ht - 1 ? 0.95 : 0.36) * (0.94 + 0.1 * hash(X, Y, 42));
+        blk(X, Y, col[0] * tone, col[1] * tone, col[2] * tone);
+      }
+}
+const CONC = [168, 172, 180], CARGO = [[226, 120, 44], [60, 160, 160], [220, 184, 70]];
+
+function depot(t) {
+  const { w, h } = K, s = h / 29, u = (v) => Math.max(1, Math.round(v * s));
+  stars(51, 0.014);
+  planet(t, w * 0.14, h * 0.74, h * 0.75, 0.16, 0.22, 1.2, 1.5, 1.34, [176, 218, 228], [92, 146, 190], [190, 212, 228]);
+  const SX = Math.round(w * 0.32), SB = Math.round(h * 0.78), TY = SB - u(3) - 1;
+  box(SX, SB, u(46), u(3), u(5), CONC);
+  if (u(3) >= 3) for (let xx = 2; xx < u(46) - 2; xx++) if ((xx >> 2) & 1) blk(SX + xx, SB - 1, 226, 120, 44);
+  const tx0 = SX + u(8) + 4, bx0 = SX + u(24) + 4;
+  box(tx0, TY, u(9), u(13), u(3), CONC, 0.32);
+  box(bx0, TY, u(14), u(6), u(3), CONC, 0.26);
+  // mast and beacon on the tower, gun on the block
+  const mx = tx0 + u(4) + 3, my = TY - u(13) - 1;
+  for (let j = 0; j < u(3); j++) put(mx, my - j, 124, 150, 156, 170);
+  if (t % 2 < 1) put(mx, my - u(3), 42, 255, 60, 52);
+  const gx = bx0 + u(8), gy = TY - u(6) - 1;
+  box(gx, gy, u(3), u(2), 1, [228, 230, 238]);
+  for (let j = 1; j <= u(3); j++) put(gx + u(3) + j + 1, gy - u(2) - j + 1, 47, 240, 150, 60);
+  // a truck comes in, unloads, and leaves
+  const ph = t % 26, dock = SX + u(10), TB = SB + u(4);
+  const tx = Math.round(ph < 6 ? lerp(w + 4, dock, 1 - (1 - ph / 6) ** 2) : ph < 18 ? dock : dock - ((ph - 18) / 8) ** 2 * (dock + u(30)));
+  box(tx, TB, u(19), 1, 2, [118, 124, 138]);
+  box(tx, TB - 1, u(4), u(2), 2, [226, 228, 236]);
+  for (let i = 0; i < 3; i++)
+    if (ph < 8 + i * 2) box(tx + u(5) + i * u(4.5), TB - 1, u(4), u(2), 2, CARGO[i]);
+  if (ph > 18) for (let j = 0; j < 3; j++) put(tx + u(19) + 5 + j * 2, TB - 1, j ? 46 : 42, 120, 220, 255);
+  // now and then a shot splashes on the shield
+  const n = Math.floor(t / 9), sp = t - n * 9;
+  const fx = SX + hash(n, 0, 44) * u(50), fy = h * (0.12 + 0.25 * hash(n, 1, 44));
+  if (sp < 0.35) {
+    const d = (1 - sp / 0.35) * 30 * s;
+    for (let j = 0; j < 3; j++) put(fx + d + j, fy - (d + j) * 0.3, 45, 255, 96, 70);
+  } else if (sp < 1.1) {
+    const a = 1 - (sp - 0.35) / 0.75, rad = (2 + 4 * (1 - a)) * s;
+    blk(fx, fy, 90 * a, 170 * a, 255 * a); blk(fx + 1, fy, 90 * a, 170 * a, 255 * a);
+    for (let i = 0; i < 14; i++)
+      put(fx + 1 + Math.cos(i / 14 * TAU) * rad, fy + 0.5 + Math.sin(i / 14 * TAU) * rad / 1.5, 111, 70 * a, 150 * a, 255 * a);
+  }
+}
+
+const SCENES = [
+  { name: "KOI", acc: [240, 132, 52], draw: koi },
+  { name: "BRANCH", acc: [230, 92, 68], draw: branch },
+  { name: "STATION", acc: [232, 190, 110], draw: station },
+  { name: "DEPOT", acc: [110, 200, 240], draw: depot },
+];
+const TITLE = "ASCII SCENES";
+const links = [...document.querySelectorAll("nav a")];
+let hot = -1, layout = null;
+
+// ---------- layout ----------
+function plan() {
+  let ts = [1, 1];
+  for (const s of [[3, 2], [2, 1], [1, 1]]) if (textWidth(TITLE, s[0]) <= cols - 8) { ts = s; break; }
+  const titleH = 5 * ts[1], top = 3 + titleH + 3;
+  let best = null;
+  for (const n of [4, 2, 1]) {
+    const lines = 4 / n, cardW = Math.floor((cols - 8 - (n - 1) * 4) / n);
+    const per = Math.floor((rows - top - 1) / lines);
+    const h = Math.min(per - 11, Math.round((cardW - 2) / 3), 46);
+    if (!best || h > best.h) best = { n, h, per };
+  }
+  const { n, per } = best, h = Math.max(6, best.h), w = h * 3, lines = 4 / n;
+  const gap = n > 1 ? Math.min(8, Math.floor((cols - 4 - n * (w + 2)) / (n - 1))) : 0;
+  const gx = Math.floor((cols - n * (w + 2) - (n - 1) * gap) / 2) + 1;
+  const block = h + 11, gy = top + Math.max(0, Math.floor((rows - top - lines * block) / 2)) + 1;
+  const ls = textWidth("STATION", 2) <= w ? 2 : 1;
+  const cards = SCENES.map((_, i) => ({ x: gx + (i % n) * (w + 2 + gap), y: gy + Math.floor(i / n) * block, w, h }));
+  layout = { ts, titleY: Math.max(1, gy - 4 - titleH), cards, ls };
+  cards.forEach((c, i) => {
+    const st = links[i].style;
+    st.left = (c.x - 1) * cw + "px"; st.top = (c.y - 1) * ch + "px";
+    st.width = (c.w + 2) * cw + "px"; st.height = (c.h + 8) * ch + "px";
+  });
+}
+
+function frameBox(c, r, g, b) {
+  whole();
+  for (let x = c.x; x < c.x + c.w; x++) { put(x, c.y - 1, 45, r, g, b); put(x, c.y + c.h, 45, r, g, b); }
+  for (let y = c.y; y < c.y + c.h; y++) { put(c.x - 1, y, 124, r, g, b); put(c.x + c.w, y, 124, r, g, b); }
+  for (const [x, y] of [[c.x - 1, c.y - 1], [c.x + c.w, c.y - 1], [c.x - 1, c.y + c.h], [c.x + c.w, c.y + c.h]]) put(x, y, 43, r, g, b);
+}
+
+function draw() {
+  flag.fill(0);
+  whole();
+  const { ts, titleY, cards, ls } = layout;
+  text(TITLE, Math.floor((cols - textWidth(TITLE, ts[0])) / 2), titleY, ts[0], ts[1], 226, 224, 214);
+  cards.forEach((c, i) => {
+    const S = SCENES[i], on = i === hot;
+    K = c;
+    S.draw(time);
+    on ? frameBox(c, S.acc[0], S.acc[1], S.acc[2]) : frameBox(c, 62, 68, 88);
+    const col = on ? S.acc : [150, 156, 172];
+    text(S.name, c.x, c.y + c.h + 2, ls, 1, col[0], col[1], col[2]);
+  });
+}
+
+function render() {
+  draw();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = `rgb(${BG})`;
+  ctx.fillRect(0, 0, W, H);
+  ctx.font = `600 ${Math.round(ch * 0.78)}px ${font}`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  let lastStyle = "";
+  for (let i = 0; i < flag.length; i++) {
+    if (!flag[i]) continue;
+    const x = (i % cols) * cw, y = ((i / cols) | 0) * ch;
+    if (flag[i] === 2) {
+      const fs = css(fill[i]);
+      if (fs !== lastStyle) ctx.fillStyle = lastStyle = fs;
+      ctx.fillRect(x + 1, y + 1, cw - 1, ch - 1);
+    }
+    const gs = css(colour[i]);
+    if (gs !== lastStyle) ctx.fillStyle = lastStyle = gs;
+    ctx.fillText(String.fromCharCode(glyph[i]), x + cw / 2, y + ch / 2 + ch * 0.06);
+  }
+}
 
 // ---------- boot ----------
 const canvas = document.querySelector("canvas");
-renderer.canvas = canvas;
-renderer.ctx = canvas.getContext("2d", { alpha: false });
-renderer.bg = document.createElement("canvas");
-renderer.font = getComputedStyle(canvas).fontFamily || "monospace";
+const ctx = canvas.getContext("2d", { alpha: false });
+const font = getComputedStyle(canvas).fontFamily || "monospace";
 
 function resize() {
   const w = window.innerWidth, h = window.innerHeight;
   if (w < 1 || h < 1) return;
-  const sx = W ? w / W : 1, sy = H ? h / H : 1;
   W = w; H = h;
-  renderer.resize(w, h, Math.min(window.devicePixelRatio || 1, 2));
-  if (!pads.length) makePlants();
-  if (!fish.length) {
-    const count = clamp(Math.round(((w * h) / 47000) * Math.pow(184 / baseLength(), 2)), 4, 60);
-    for (let i = 0; i < count; i++) fish.push(makeFish(i, count));
-    fish.sort((a, b) => a.depth - b.depth);
-  } else {
-    for (const f of fish) {
-      f.x *= sx; f.y *= sy;
-      for (let k = 0; k < K; k++) { f.px[k] *= sx; f.py[k] *= sy; }
-    }
-  }
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+  cw = clamp(Math.round(w / 260), 4, 8); ch = Math.round(cw * 1.5);
+  cols = Math.ceil(w / cw); rows = Math.ceil(h / ch);
+  flag = new Uint8Array(cols * rows); glyph = new Uint8Array(cols * rows);
+  colour = new Uint32Array(cols * rows); fill = new Uint32Array(cols * rows);
+  plan();
+  render();
 }
 
-const STEP = 1 / 60;
-// Frames drawn per second. 30 halves the work of a 60 Hz display; override with ?fps=20 etc.
-const FPS = clamp(Number(new URLSearchParams(location.search).get("fps")) || 30, 5, 120);
+// Frames drawn per second; override with ?fps=20 etc.
+const FPS = clamp(Number(params.get("fps")) || 30, 5, 120);
 const still = window.matchMedia("(prefers-reduced-motion: reduce)");
-let last = 0, acc = 0;
+let last = 0;
 
 function frame(now) {
   requestAnimationFrame(frame);
-  if (now - last < 1000 / FPS - 2) return;                         // not time for the next frame yet
-  const dt = Math.min(0.1, (now - last) / 1000);
+  if (now - last < 1000 / FPS - 2) return;
+  time += Math.min(0.1, (now - last) / 1000);
   last = now;
-  acc += dt;
-  let n = 0;
-  while (acc >= STEP && n < 4) { step(STEP); acc -= STEP; n++; }
-  if (n === 4) acc = 0;
-  renderer.render(dt);
+  render();
 }
 
-function drawStill() {
-  for (let i = 0; i < 240; i++) { step(STEP); renderer.diffuse(STEP); }
-  renderer.render(STEP);
-}
-
-window.addEventListener("resize", () => { resize(); if (still.matches) renderer.render(STEP); });
+links.forEach((a, i) => {
+  const set = (v) => () => { hot = v; if (still.matches) render(); };
+  a.addEventListener("pointerenter", set(i)); a.addEventListener("focus", set(i));
+  a.addEventListener("pointerleave", set(-1)); a.addEventListener("blur", set(-1));
+});
+window.addEventListener("pageshow", () => { hot = -1; });
+window.addEventListener("resize", resize);
+time = Number(params.get("t")) || 0;                                 // ?t=20 starts 20 seconds in
 resize();
-if (still.matches) {
-  drawStill();
-} else {
-  step(STEP);
+if (!still.matches) {
   last = performance.now();
   requestAnimationFrame(frame);
 }
