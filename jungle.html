@@ -1,0 +1,1768 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ascii jungle</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #08100e; overflow: hidden; }
+  canvas {
+    display: block; width: 100vw; height: 100vh;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+</style>
+</head>
+<body>
+<canvas aria-hidden="true"></canvas>
+<script>
+"use strict";
+
+// ---------- small helpers ----------
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (t) => t * t * (3 - 2 * t);
+
+function hash(x, y, s) {
+  let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(s | 0, 1274126177)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function noise2(x, y, s) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const u = smooth(x - xi), v = smooth(y - yi);
+  return lerp(
+    lerp(hash(xi, yi, s), hash(xi + 1, yi, s), u),
+    lerp(hash(xi, yi + 1, s), hash(xi + 1, yi + 1, s), u),
+    v
+  );
+}
+const noise1 = (x, s) => noise2(x, 0, s);
+function angleDiff(a, b) {
+  let d = (a - b) % TAU;
+  if (d > Math.PI) d -= TAU;
+  if (d < -Math.PI) d += TAU;
+  return d;
+}
+// Seeded random numbers, so the same seed always grows the same jungle.
+function mulberry(a) {
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const pack = (r, g, b) => (clamp(r | 0, 0, 255) << 16) | (clamp(g | 0, 0, 255) << 8) | clamp(b | 0, 0, 255);
+const tone = (c, k) => pack(c[0] * k, c[1] * k, c[2] * k);
+const rgb = (r, g, b) => `rgb(${Math.round(clamp(r, 0, 255))},${Math.round(clamp(g, 0, 255))},${Math.round(clamp(b, 0, 255))})`;
+const cssCache = new Map();
+function css(c) {
+  c &= 0xf8f8f8;
+  let v = cssCache.get(c);
+  if (v === undefined) cssCache.set(c, (v = `rgb(${c >>> 16},${(c >>> 8) & 255},${c & 255})`));
+  return v;
+}
+// A line drawn at this angle looks most like which character?
+function dirGlyph(a) {
+  a = ((a % Math.PI) + Math.PI) % Math.PI;
+  if (a < Math.PI / 8 || a >= (7 * Math.PI) / 8) return 45;   // -
+  if (a < (3 * Math.PI) / 8) return 92;                        // \
+  if (a < (5 * Math.PI) / 8) return 124;                       // |
+  return 47;                                                   // /
+}
+
+// ---------- look ----------
+const params = new URLSearchParams(location.search);
+const SEED = Number(params.get("seed")) || 1 + ((Math.random() * 1e6) | 0);   // ?seed=123 to keep a jungle
+const BG = [8, 16, 14];                   // deep shade
+const MIST = [90, 122, 80];              // where the sun gets through the canopy
+const GRID = "rgba(190,255,200,0.05)";    // cell border lines
+const RAMP = ".:;=+*#%@";                 // sparse -> dense, picked by brightness
+// distant foliage, far to near: colour, how much it fades into the mist, size of its masses, how much of it there is
+const LAYERS = [
+  { col: [34, 68, 52], haze: 0.5, scale: 170, cut: 0.6 },
+  { col: [16, 40, 30], haze: 0.22, scale: 120, cut: 0.66 },
+  { col: [9, 24, 19], haze: 0, scale: 90, cut: 0.74 },
+];
+const FAR_TRUNK = [38, 46, 40];
+const EARTH = [22, 28, 18];
+const MOSS_TOP = [44, 78, 36];
+const BARK_LIGHT = [128, 106, 76];
+const BARK_DARK = [20, 20, 15];
+const MOSS = [78, 128, 52];
+const LEAF = [58, 132, 52];
+const LEAF_DARK = [10, 30, 20];           // the canopy overhead, seen against the light
+const FLOWER = [240, 96, 150];
+const VINE = [96, 116, 52];
+const VINE_THIN = [70, 138, 62];
+const FERN = [52, 140, 70];
+const MOTE = [226, 232, 150];
+const FURS = [[176, 110, 56], [214, 150, 60], [176, 166, 158]];   // one coat per monkey
+const BELLY = [226, 196, 150];
+const FACE = [232, 196, 160];
+const EYE = [14, 12, 12];
+const SN_BODY = [124, 204, 62];
+const SN_MARK = [246, 240, 150];
+const SN_BELLY = [226, 214, 96];
+const TONGUE = [240, 60, 70];
+const FRUIT = [255, 158, 30];
+const FRUIT_INK = [150, 60, 8];
+
+// ---------- the jungle (continuous space, no grid involved) ----------
+let W = 0, H = 0, time = 0;
+let S = 100;                              // a monkey's size, px: everything it does is measured in these
+let RT = 50;                              // radius of the two big trunks
+let GRAV = 2000;
+const limbs = [], vines = [], clumps = [], ferns = [], motes = [], bits = [];
+const fruits = [], shots = [];             // bunches of fruit on the boughs, and fruit in the air
+const trunks = [{ x: 0, seed: 11 }, { x: 0, seed: 23 }];
+
+const floorY = (x) => H * 0.915 + (noise1(x / 260, SEED + 5) - 0.5) * H * 0.03;
+// the trunks flare out into roots where they meet the ground
+const trunkR = (y) => RT * (1 + 0.55 * Math.pow(clamp((y - (H * 0.915 - 2.4 * RT)) / (2.4 * RT), 0, 1), 2));
+const radius = (l, t) => lerp(l.r0, l.r1, Math.pow(t, 0.85));
+function gust() { return 0.35 + 0.65 * noise1(time * 0.13, 7); }
+
+// A bough: a chain of joints that wanders a little but keeps its heading.
+// Monkeys can walk off the base of an `exit` bough, behind the trunk.
+function bough(x0, y0, a0, len, r0, exit, rnd) {
+  const n = clamp(Math.round(len / 22), 6, 48);
+  const l = {
+    x0, y0, a0, n, seg: len / n, len, r0, r1: Math.max(1.5, r0 * 0.1), exit,
+    side: Math.cos(a0) >= 0 ? 1 : -1,       // which side of the wood counts as its top
+    seed: (rnd() * 1e6) | 0, ph: rnd() * TAU,
+    flex: 0, fv: 0,                       // how far it is bent under the monkeys on it, and how fast that is changing
+    bend: new Float32Array(n),            // angle change at each joint, at rest
+    a: new Float32Array(n),               // direction of each segment, right now
+    x: new Float32Array(n + 1), y: new Float32Array(n + 1),
+  };
+  let a = a0;
+  for (let k = 0; k < n; k++) {
+    l.bend[k] = (rnd() - 0.5) * 0.1 + clamp(angleDiff(a0, a), -1, 1) * 0.08;
+    a += l.bend[k];
+  }
+  limbs.push(l);
+  return l;
+}
+
+// Work out where every joint is right now: the rest shape, plus a sway that
+// thin wood feels much more than thick wood, plus the bend of a springy bough
+// under whoever is standing on it (more, the further out they are).
+function pose(dt) {
+  const g = gust();
+  for (const l of limbs) {
+    let load = 0;
+    for (const m of monkeys) if (m.on && m.l === l && (m.mode === "walk" || m.mode === "sit")) load += clamp(m.s / l.len, 0, 1) * m.scale;
+    l.fv += (140 * (load * 0.0011 - l.flex) - 7 * l.fv) * dt;
+    l.flex += l.fv * dt;
+    let x = l.x0, y = l.y0, a = l.a0;
+    l.x[0] = x; l.y[0] = y;
+    for (let k = 0; k < l.n; k++) {
+      const wind = Math.sin(time * 0.8 + l.ph + k * 0.3) + 0.5 * Math.sin(time * 1.7 + l.ph * 1.7);
+      a += l.bend[k] + (g * wind * 0.018) / (1 + radius(l, (k + 0.5) / l.n) * 0.6) + l.side * l.flex;
+      l.a[k] = a;
+      x += Math.cos(a) * l.seg; y += Math.sin(a) * l.seg;
+      l.x[k + 1] = x; l.y[k + 1] = y;
+    }
+  }
+}
+
+// The point on top of limb `l`, `s` px from its base (s may run past either end).
+const P = { x: 0, y: 0, tx: 1, ty: 0, nx: 0, ny: -1 };
+function surf(l, s) {
+  const f = s / l.seg;
+  const k = clamp(Math.floor(f), 0, l.n - 1), t = f - k;
+  const g = f - 0.5, k0 = clamp(Math.floor(g), 0, l.n - 2);
+  const a = lerp(l.a[k0], l.a[k0 + 1], clamp(g - k0, 0, 1));     // eased across the joints
+  const r = radius(l, clamp(s / l.len, 0, 1));
+  P.tx = Math.cos(a); P.ty = Math.sin(a);
+  P.nx = l.side * P.ty; P.ny = -l.side * P.tx;
+  P.x = l.x[k] + (l.x[k + 1] - l.x[k]) * t + P.nx * r;
+  P.y = l.y[k] + (l.y[k + 1] - l.y[k]) * t + P.ny * r;
+}
+// The same, `off` px further along in the direction `dir` and `h` px above the bark.
+const F = { x: 0, y: 0 };
+function placeOn(l, s, dir, off, h) {
+  surf(l, s + dir * off);
+  F.x = P.x + P.nx * h; F.y = P.y + P.ny * h;
+}
+
+// ---------- vines ----------
+// A vine is a rope of particles (Verlet integration: each one remembers where
+// it was, and a few passes pull neighbours back to the right distance). When a
+// monkey hangs on one, the part above its hands turns into a pendulum with the
+// monkey as the bob, and only the loose end below is still a rope.
+function makeVine(o) {
+  const n = clamp(Math.round(o.len / (S * 0.13)), 4, 64);
+  const v = {
+    limb: o.limb || null, at: o.at || 0, ax: o.x || 0, ay: o.y || 0,
+    loop: o.bx !== undefined, bx: o.bx || 0, by: o.by || 0,
+    n, seg: o.len / n, len: o.len,
+    swing: !!o.grip, grip: o.grip || 0,   // where along it a monkey takes hold, px from the top
+    rider: null, load: null,              // load: { L, th, om, w, pump }
+    seed: (Math.random() * 1e6) | 0, ph: Math.random() * TAU,
+    x: new Float32Array(n + 1), y: new Float32Array(n + 1),
+    px: new Float32Array(n + 1), py: new Float32Array(n + 1),
+  };
+  anchorVine(v);
+  for (let k = 0; k <= n; k++) {
+    v.x[k] = v.px[k] = v.loop ? lerp(v.ax, v.bx, k / n) : v.ax + Math.sin(k * 0.7 + v.ph) * 2;
+    v.y[k] = v.py[k] = v.loop ? lerp(v.ay, v.by, k / n) : v.ay + k * v.seg;
+  }
+  vines.push(v);
+  return v;
+}
+function anchorVine(v) {
+  if (!v.limb) return;
+  const l = v.limb;
+  v.ax = l.x[v.at]; v.ay = l.y[v.at] + radius(l, v.at / l.n) * 0.6;
+}
+
+// The point `L` px down the vine.
+const Q = { x: 0, y: 0 };
+function vinePoint(v, L) {
+  const f = clamp(L / v.seg, 0, v.n - 1e-3), k = Math.floor(f), t = f - k;
+  Q.x = lerp(v.x[k], v.x[k + 1], t); Q.y = lerp(v.y[k], v.y[k + 1], t);
+}
+
+// A monkey takes hold at (gx, gy), arriving at speed (vx, vy). The vine comes
+// to its hands, not the other way round. The part of its speed that runs across
+// the vine becomes swing; the part that runs along it stretches the vine, which
+// springs back.
+function newLoad(L, th, om, ev) { return { L, th, om, e: 0, ev, R: L, w: 0, pump: 0 }; }
+function grabAt(v, gx, gy, vx, vy) {
+  const dx = gx - v.ax, dy = gy - v.ay, th = Math.atan2(dx, dy), L = clamp(Math.hypot(dx, dy), v.seg, v.len - v.seg);
+  const sn = Math.sin(th), cs = Math.cos(th);
+  v.load = newLoad(L, th, (vx * cs - vy * sn) / L, (vx * sn + vy * cs) * 0.8);
+}
+function letGo(v) { v.load = null; v.rider = null; }
+
+function stepVines(dt) {
+  const g = gust(), dt2 = dt * dt;
+  for (const v of vines) {
+    anchorVine(v);
+    const { n, seg, x, y, px, py } = v, ld = v.load;
+    let k0 = 1, gx = v.ax, gy = v.ay, rest0 = seg;                 // first loose particle, and what it hangs from
+    if (ld) {
+      // the pendulum: gravity pulls it back, the air slows it, and the monkey
+      // pumps it like a child on a swing until it goes high enough
+      for (let i = 0; i < 2; i++) {
+        const gl = GRAV / ld.R;
+        let acc = -gl * Math.sin(ld.th) - 0.35 * ld.om;
+        if (ld.pump && (0.5 * ld.om * ld.om) / gl + 1 - Math.cos(ld.th) < 1 - Math.cos(0.8))
+          acc += 0.4 * gl * (Math.abs(ld.om) > 0.08 ? Math.sign(ld.om) : ld.pump);
+        ld.om += acc * dt * 0.5; ld.th += ld.om * dt * 0.5;
+        ld.ev += (-200 * ld.e - 12 * ld.ev) * dt * 0.5; ld.e += ld.ev * dt * 0.5;
+      }
+      ld.e = clamp(ld.e, -0.15 * S, 0.3 * S);
+      ld.R = ld.L + ld.e;                                          // its length right now, stretch included
+      ld.w = Math.min(1, ld.w + dt * 7);
+      const sx = Math.sin(ld.th), cy = Math.cos(ld.th);
+      gx = v.ax + sx * ld.R; gy = v.ay + cy * ld.R;
+      k0 = Math.floor(ld.R / seg) + 1;
+      for (let k = 1; k < k0 && k <= n; k++) {                      // pulled taut between the anchor and its hands
+        px[k] = x[k]; py[k] = y[k];
+        x[k] = lerp(x[k], v.ax + sx * k * seg, ld.w); y[k] = lerp(y[k], v.ay + cy * k * seg, ld.w);
+      }
+      rest0 = k0 * seg - ld.R;
+    }
+    x[0] = px[0] = v.ax; y[0] = py[0] = v.ay;
+    const last = v.loop ? n - 1 : n;
+    for (let k = k0; k <= last; k++) {
+      const vx = (x[k] - px[k]) * 0.985, vy = (y[k] - py[k]) * 0.985;
+      px[k] = x[k]; py[k] = y[k];
+      x[k] += vx + (g - 0.3) * 170 * Math.sin(time * 0.7 + v.ph + k * 0.2) * dt2;
+      y[k] += vy + GRAV * dt2;
+    }
+    for (let it = 0; it < 14; it++) {
+      if (k0 <= n) {
+        const dx = x[k0] - gx, dy = y[k0] - gy, d = Math.hypot(dx, dy) || 1e-3;
+        x[k0] = gx + (dx / d) * rest0; y[k0] = gy + (dy / d) * rest0;
+      }
+      for (let k = k0 + 1; k <= n; k++) {
+        const dx = x[k] - x[k - 1], dy = y[k] - y[k - 1], d = Math.hypot(dx, dy) || 1e-3, e = ((d - seg) / d) * 0.5;
+        x[k - 1] += dx * e; y[k - 1] += dy * e;
+        x[k] -= dx * e; y[k] -= dy * e;
+      }
+      if (v.loop) { x[n] = v.bx; y[n] = v.by; }
+    }
+  }
+}
+
+// ---------- fruit ----------
+// Fruit grows in bunches on top of the boughs. `back` holds, for each fruit,
+// the time it grows back (0 = it is there).
+const fruitLeft = (sp) => { let n = 0; for (let j = 0; j < sp.n; j++) if (sp.back[j] <= time) n++; return n; };
+const FP = { x: 0, y: 0 };
+function fruitPos(sp, j) {
+  const l = sp.l, cw = renderer.cw, ch = renderer.ch;
+  FP.x = l.x[sp.at] + (hash(j, 1, sp.seed) - 0.5) * cw * 6;
+  FP.y = l.y[sp.at] - radius(l, sp.at / l.n) - ch * (0.7 + hash(j, 2, sp.seed) * 1.8);
+}
+// The nearest bunch on the monkey's own bough that still has fruit. With
+// `danger` set, bunches within that distance of the snake do not count (the
+// monkey cannot get to them past it), nor do ones too far off to fetch in time.
+function findFruit(m, danger) {
+  let best = null, bd = Infinity;
+  for (const sp of fruits) {
+    if (sp.l !== m.l || !fruitLeft(sp)) continue;
+    const d = Math.abs(sp.s - m.s);
+    if (danger && (d > 2.5 * m.S || Math.hypot(sp.l.x[sp.at] - snake.sx, sp.l.y[sp.at] - snake.sy) < danger)) continue;
+    if (d < bd) { bd = d; best = sp; }
+  }
+  return best;
+}
+
+// ---------- loose things in the air ----------
+function shake(x, y) {                    // leaves knocked loose
+  if (bits.length > 40) return;
+  for (let i = 0; i < 3; i++) bits.push({ x: x + (Math.random() - 0.5) * 70, y: y + Math.random() * 20, ph: Math.random() * TAU, fruit: false });
+}
+function splat(x, y) {                    // what is left of a thrown fruit
+  for (let i = 0; i < 5; i++) bits.push({ x: x + (Math.random() - 0.5) * 30, y: y + (Math.random() - 0.5) * 20, ph: Math.random() * TAU, fruit: true });
+}
+function stepAir(dt) {
+  for (const f of motes) {
+    f.x += (Math.sin(time * 0.5 + f.ph) * 7 + 3) * dt;
+    f.y += (Math.cos(time * 0.4 + f.ph * 2) * 6 - 2) * dt;
+    if (f.x > W + 5) f.x = -5;
+    if (f.y < -5) f.y = H * 0.9;
+  }
+  for (let i = bits.length - 1; i >= 0; i--) {
+    const b = bits[i];
+    b.y += (b.fruit ? 160 : 45 + 15 * Math.sin(time * 2 + b.ph)) * dt;
+    b.x += Math.sin(time * 3 + b.ph) * 34 * dt;
+    if (b.y > H * 0.94) bits.splice(i, 1);
+  }
+  // thrown fruit: a stone under gravity, until it hits the snake or the ground
+  const s = snake, hot = s.on && (s.state === "travel" || s.state === "lurk" || s.state === "strike");
+  for (let i = shots.length - 1; i >= 0; i--) {
+    const q = shots[i];
+    q.vy += GRAV * dt;
+    q.x += q.vx * dt; q.y += q.vy * dt;
+    let hit = false;
+    if (hot) for (let k = 0; k < NS + 4 && !hit; k++) hit = s.z[k] > 0 && Math.hypot(s.x[k] - q.x, s.y[k] - q.y) < s.L * 0.028 + 6;   // only a hit on the head or neck counts
+    if (hit) { splat(q.x, q.y); knockDown(q.vx, q.vy); }
+    if (hit || q.y > floorY(q.x) || q.x < -20 || q.x > W + 20) { if (!hit) splat(q.x, q.y - 6); shots.splice(i, 1); }
+  }
+}
+
+// ---------- monkeys ----------
+// A monkey is seven points (hips, shoulders, head, two hands, two feet) hung on
+// one anchor: the spot on the bark it stands on, the place on the vine it holds,
+// or a point flying along an arc between the two. Each way of moving works out
+// where the seven points should be; whenever it switches from one to another,
+// the old pose is remembered relative to the anchor and blended into the new
+// one, so nothing snaps. Elbows and knees are then found by inverse kinematics.
+const NT = 10;                            // tail segments
+const rm = mulberry(SEED ^ 0x5bd1e995);   // their own dice, so ?seed= replays the same troop
+const monkeys = [0, 1, 2].map((i) => ({
+  on: false, at: 0, scale: [1, 0.9, 0.76][i], fur: FURS[i], S: 100, fresh: true,
+  mode: "walk", l: null, s: 0, dir: 1, face: 1, v: 0, phase: 0, until: 0,
+  vine: null, climb: 1, h1: 0, h1v: 0, h2: 0, h2v: 0,
+  rev: 0, revWant: 0, revMax: 7, lastSign: 0, flipped: false,
+  sq: 0, sqv: 0, jumpC: null, jumpAt: 0,
+  fruit: false, hungryAt: 0, eatUntil: 0, goal: null, act: null, alarm: 0,   // act: picking or throwing, { kind, t, spot, done }   // legs as springs: how far the body has sunk, and a jump it is crouching for
+  decided: true, leaving: false, scared: 0, turnOk: 0, look: 1, lookAt: 0, scratch: false, ph: i * 2.1, fa: 0,
+  fly: { x0: 0, y0: 0, vx: 0, vy: 0, t: 0, T: 1, a0: 0, h0: 0, vine: null, l: null, s: 0, push: new Float32Array(4) },
+  ax: 0, ay: 0, pts: new Float32Array(14), old: new Float32Array(14), blend: 1,
+  hfx: 1, hfy: 0, brx: 0, bry: -1, ehx: -1, ehy: 0, khx: 1, khy: 0, bkx: 0, bky: -1,
+  arms: [new Float32Array(6), new Float32Array(6)], legs: [new Float32Array(6), new Float32Array(6)],
+  tailInit: false, ta: new Float32Array(NT), tx: new Float32Array(NT + 1), ty: new Float32Array(NT + 1),
+}));
+
+// What the current way of moving wants this frame: the anchor, the seven
+// points (hips, shoulders, head, near hand, far hand, near foot, far foot),
+// which way the head faces, where the back is, and which way elbows and knees
+// bend. `tailMode`: 0 arched over the back, 1 hanging, 2 trailing.
+const A = { x: 0, y: 0 };
+const T = new Float32Array(14);
+const HF = [1, 0], BR = [0, -1], EH = [-1, 0], KH = [1, 0];
+let tailMode = 0;
+const setT = (i, x, y) => { T[i * 2] = x; T[i * 2 + 1] = y; };
+
+function snap(m, ax = m.ax, ay = m.ay) {
+  for (let i = 0; i < 14; i += 2) { m.old[i] = m.pts[i] - ax; m.old[i + 1] = m.pts[i + 1] - ay; }
+  m.blend = 0;
+}
+
+function spawnMonkey(m) {
+  m.on = true; m.fresh = true; m.S = S * m.scale;
+  m.vine = null; m.scared = 0; m.decided = true; m.leaving = false; m.v = 0; m.sq = m.sqv = 0; m.jumpC = null;
+  m.fruit = false; m.goal = null; m.act = null; m.alarm = 0; m.hungryAt = time + 3 + rm() * 10;
+  const tops = vines.filter((v) => v.swing && !v.limb && !v.rider);
+  if (tops.length && rm() < 0.45) {
+    // climbs down out of the canopy
+    const v = tops[(rm() * tops.length) | 0];
+    v.rider = m; v.load = newLoad(0.3 * S, 0, 0, 0);
+    m.vine = v; m.mode = "climb"; m.climb = 1; m.face = rm() < 0.5 ? -1 : 1;
+    m.h1 = m.h2 = m.h1v = m.h2v = 0;
+  } else {
+    // walks in along a bough from behind the trunk
+    m.l = limbs.find((l) => l.exit); m.s = -1.5 * m.S; m.dir = 1;
+    m.mode = "walk"; m.until = time + 2 + rm() * 3;
+  }
+}
+
+// Places it might leap to from (x, y), in the direction it faces: free vines
+// that are hanging still, and spots on the boughs. `fromVine` matters because
+// hands on a vine are a body length above where feet would be.
+const cands = [];
+function findTargets(m, x, y, face, fromVine) {
+  const Z = m.S;
+  cands.length = 0;
+  for (const v of vines) {
+    if (!v.swing || v.rider || v === m.vine) continue;
+    const k = Math.min(v.n, Math.round(v.grip / v.seg));
+    if (Math.hypot(v.x[k] - v.px[k], v.y[k] - v.py[k]) > 2.5) continue;   // still swinging from the last monkey: can't judge it
+    vinePoint(v, v.grip);
+    const dx = (Q.x - x) * face, dy = Q.y - y;
+    if (dx < 0.3 * Z || dx > 3.8 * Z) continue;
+    if (fromVine ? dy < -1.4 * Z || dy > 1.8 * Z : dy < -2.2 * Z || dy > 0.6 * Z) continue;
+    cands.push({ vine: v, l: null, s: 0, h0: Math.atan2(-face * 0.6, 1) });   // h0: the body will trail behind the hands
+  }
+  for (const l of limbs) {
+    if (l === m.l && !fromVine) continue;
+    for (let i = 0; i < 5; i++) {
+      const s = lerp((l.exit ? 1.6 : 1) * RT + 0.8 * Z, l.len - 0.8 * Z, rm());
+      surf(l, s);
+      const dx = (P.x - x) * face, dy = P.y - y;
+      if (dx < (fromVine ? 0.2 : 0.8) * Z || dx > 3.8 * Z || P.x < W * 0.04 || P.x > W * 0.96) continue;
+      if (dy < (fromVine ? -0.2 : -1.2) * Z || dy > 3.2 * Z) continue;
+      cands.push({ vine: null, l, s, h0: 0 });
+      break;
+    }
+  }
+  return cands.length;
+}
+
+// A leap is a real throw: once in the air nothing steers it, so everything is
+// settled at take-off. The body's middle has to get from (x0, y0) to (tx, ty)
+// under gravity; for each flight time T there is exactly one launch velocity
+// that does it, v = d/T - gT/2. Of all of those, take the one closest to how
+// the monkey is already moving (nvx, nvy), so its momentum carries through,
+// and call the leap possible if muscle can make up the difference.
+const PL = { vx: 0, vy: 0, T: 0 };
+function plan(tx, ty, x0, y0, nvx, nvy, maxDv, landing) {
+  let best = Infinity;
+  for (let T = 0.2; T <= 1.3; T += 0.03) {
+    const vx = (tx - x0) / T, vy = (ty - y0) / T - 0.5 * GRAV * T;
+    if (landing && vy + GRAV * T < 1.5 * S) continue;              // a bough has to be come down onto
+    const dv = Math.hypot(vx - nvx, vy - nvy);
+    if (dv < best) { best = dv; PL.vx = vx; PL.vy = vy; PL.T = T; }
+  }
+  return best <= maxDv;
+}
+// Where its middle will be when it has hold of target `c`, then plan the throw.
+function aim(m, c, nvx, nvy, maxDv) {
+  const Z = m.S, p = m.pts;
+  let tx, ty;
+  if (c.vine) { vinePoint(c.vine, c.vine.grip); tx = Q.x + Math.sin(c.h0) * 0.59 * Z; ty = Q.y + Math.cos(c.h0) * 0.59 * Z; }
+  else { surf(c.l, c.s); tx = P.x + P.nx * 0.33 * Z; ty = P.y + P.ny * 0.33 * Z; }
+  return plan(tx, ty, (p[0] + p[2]) / 2, (p[1] + p[3]) / 2, nvx, nvy, maxDv, !c.vine);
+}
+// One of the places in reach that it can actually make, or null.
+function pick(m, fromVine, face, nvx, nvy, maxDv) {
+  const n = findTargets(m, m.ax, m.ay, face, fromVine);
+  for (let i = 0, j = (rm() * n) | 0; i < n; i++, j = (j + 1) % n) if (aim(m, cands[j], nvx, nvy, maxDv)) return cands[j];
+  return null;
+}
+
+// Let go and fly, as just planned.
+function startFly(m, c) {
+  const Z = m.S, f = m.fly, p = m.pts;
+  f.x0 = (p[0] + p[2]) / 2; f.y0 = (p[1] + p[3]) / 2;
+  f.vx = PL.vx; f.vy = PL.vy; f.T = PL.T; f.t = 0;
+  f.vine = c.vine; f.l = c.l; f.s = c.s; f.h0 = c.h0;
+  f.a0 = Math.atan2(p[3] - p[1], p[2] - p[0]);                      // how it is tilted as it leaves
+  f.push[0] = p[10]; f.push[1] = p[11]; f.push[2] = p[12]; f.push[3] = p[13];   // the feet push off from here
+  if (c.vine) c.vine.rider = m;                                      // nobody else may take it
+  if (m.vine) letGo(m.vine);
+  else if (m.l) m.l.fv += 0.012 * clamp(m.s / m.l.len, 0, 1);       // the bough is kicked away
+  m.vine = null; m.jumpC = null; m.goal = null; m.act = null;
+  if (Math.abs(f.vx) > 0.3 * Z) m.face = f.vx > 0 ? 1 : -1;
+  snap(m, f.x0, f.y0);
+  m.mode = "fly";
+}
+
+function beginSwing(m, flying) {
+  m.rev = 0; m.flipped = false;
+  m.lastSign = flying ? m.face : 0;
+  m.revWant = flying ? (rm() < 0.55 ? 0 : 2) : 1;                    // straight on, or one more swing first
+  m.revMax = m.vine.limb ? 2 + ((rm() * 3) | 0) : 7;
+}
+
+// Arriving: whatever speed it comes in with goes into the swing of the vine,
+// or into its legs and the bough.
+function logicFly(m) {
+  const f = m.fly, Z = m.S;
+  if (f.t < f.T) return;
+  const vx = f.vx, vy = f.vy + GRAV * f.T;
+  if (f.vine) {
+    const v = f.vine;
+    grabAt(v, m.ax - Math.sin(f.h0) * 0.59 * Z, m.ay - Math.cos(f.h0) * 0.59 * Z, vx, vy);
+    snap(m, v.ax + Math.sin(v.load.th) * v.load.L, v.ay + Math.cos(v.load.th) * v.load.L);
+    m.vine = v; m.mode = "swing";
+    m.h1 = m.h2 = f.h0; m.h1v = m.h2v = 0;
+    beginSwing(m, true);
+    shake(v.ax, v.limb ? v.ay : 0);
+  } else {
+    const l = f.l;
+    surf(l, f.s);
+    snap(m, P.x, P.y);
+    const vt = vx * P.tx + vy * P.ty, vn = Math.min(0, vx * P.nx + vy * P.ny);
+    m.l = l; m.s = f.s; m.dir = vt >= 0 ? 1 : -1; m.phase = 0.3;
+    m.v = Math.min(Math.abs(vt), 5 * Z);                             // runs off the speed it lands with
+    m.sq = 0; m.sqv = vn * 0.6;                                      // and its legs take up the fall
+    l.fv += (-vn / Z) * clamp(f.s / l.len, 0, 1) * 0.004;            // so does the bough
+    m.mode = "walk"; m.until = time + 0.6 + rm() * 2.5;
+  }
+}
+
+function logicVine(m, dt) {
+  const Z = m.S, v = m.vine, ld = v.load;
+  if (m.mode === "climb") {
+    ld.pump = 0; ld.om *= Math.exp(-dt * 1.2);
+    ld.L += m.climb * 1.15 * Z * dt;
+    if (m.climb > 0 && ld.L >= v.grip) {
+      ld.L = v.grip; snap(m); m.mode = "swing"; beginSwing(m, false);
+    } else if (m.climb < 0) {
+      if (v.limb && ld.L < 0.95 * Z) {
+        // up at the bough the vine hangs from: swing a leg over
+        const l = v.limb, c = { vine: null, l, s: clamp(v.at * l.seg + (rm() < 0.5 ? -0.6 : 0.6) * Z, 1.6 * RT + 0.8 * Z, l.len - 0.8 * Z), h0: 0 };
+        aim(m, c, 0, 0, 0);
+        startFly(m, c);
+      } else if (!v.limb && ld.L < 0.3 * S) {
+        letGo(v); m.on = false; m.at = time + 5 + rm() * 10;         // gone into the canopy
+      }
+    }
+    return;
+  }
+  ld.pump = m.face;
+  const sg = ld.om > 0.06 ? 1 : ld.om < -0.06 ? -1 : 0;
+  if (sg && sg !== m.lastSign) { m.lastSign = sg; m.rev++; }
+  // Swinging forward: if letting go right now, with no more than a tug of the
+  // arms, would carry it to something it can catch, it lets go.
+  if (sg === m.face && m.rev >= m.revWant) {
+    const vt = ld.om * ld.R;
+    const c = pick(m, true, m.face, vt * Math.cos(ld.th), -vt * Math.sin(ld.th), 1.2 * Z + 0.2 * Math.abs(vt));
+    if (c) { startFly(m, c); return; }
+  }
+  if (m.rev > m.revMax) {
+    if (v.limb || m.flipped) { snap(m); m.mode = "climb"; m.climb = -1; }   // nothing in reach: climb back up
+    else { m.face = -m.face; m.flipped = true; m.rev = 0; m.revWant = 0; }  // try the other way
+  }
+}
+
+function turn(m) { snap(m); m.dir = -m.dir; m.v = 0; }
+function sitEat(m) { snap(m); m.mode = "sit"; m.eatUntil = time + 3.5 + rm() * 3; m.until = m.eatUntil + 0.5 + rm() * 2; m.lookAt = 0; }
+const JUMP = 7.5;                         // the hardest it can push off, in body lengths per second
+// Found something to jump to: crouch first, jump in a moment.
+function leap(m) {
+  surf(m.l, m.s);
+  const fx = P.tx * m.dir, fy = P.ty * m.dir;
+  const c = pick(m, false, fx >= 0 ? 1 : -1, fx * m.v, fy * m.v, JUMP * m.S);
+  if (!c) return false;
+  m.jumpC = { vine: c.vine, l: c.l, s: c.s, h0: c.h0 }; m.jumpAt = time + 0.17;
+  if (c.vine) c.vine.rider = m;
+  return true;
+}
+
+function logicGround(m, dt) {
+  const Z = m.S, l = m.l;
+  // legs are springs: the body sinks when it lands or gathers itself, and bounces back
+  m.sqv += (-260 * (m.sq - (m.jumpC ? -0.16 * Z : 0)) - 16 * m.sqv) * dt;
+  m.sq = clamp(m.sq + m.sqv * dt, -0.22 * Z, 0.2 * Z);
+  if (m.jumpC) {
+    m.v *= Math.exp(-dt * 4);
+    m.s += m.dir * m.v * dt;
+    if (time < m.jumpAt) return;
+    const c = m.jumpC;
+    m.jumpC = null;
+    surf(l, m.s);
+    if (aim(m, c, P.tx * m.dir * m.v, P.ty * m.dir * m.v, JUMP * Z * 1.15)) startFly(m, c);
+    else if (c.vine) c.vine.rider = null;                          // thought better of it
+    return;
+  }
+  // busy with its hands: picking a fruit, or throwing one
+  if (m.act) {
+    const a = m.act;
+    a.t += dt; m.v *= Math.exp(-dt * 10);
+    if (a.kind === "pick") {
+      if (!a.done && a.t > 0.22) {
+        a.done = true;
+        for (let j = 0; j < a.spot.n; j++) if (a.spot.back[j] <= time) { a.spot.back[j] = time + 110 + rm() * 110; m.fruit = true; break; }
+      }
+      if (a.t > 0.45) { snap(m); m.act = null; if (m.fruit && m.alarm < time) sitEat(m); }
+    } else {
+      if (!a.done && a.t > 0.36) {
+        // let fly: the same throw as a leap, aimed at the snake's head
+        a.done = true; m.fruit = false;
+        const x0 = m.pts[8], y0 = m.pts[9], dx = snake.hx - x0, dy = snake.hy - y0;
+        const T = clamp(Math.hypot(dx, dy) / (6.5 * S), 0.3, 0.9), err = 1 + (rm() - 0.5) * 0.5;   // its aim is not that good
+        shots.push({ x: x0, y: y0, vx: (dx / T) * err, vy: (dy / T - 0.5 * GRAV * T) * (1 + (rm() - 0.5) * 0.2) });
+      }
+      if (a.t > 0.62) { snap(m); m.act = null; }
+    }
+    return;
+  }
+  // The snake has struck: throw fruit at it if there is any to hand or within
+  // safe reach, otherwise run.
+  if (!snake.on || (snake.state !== "lurk" && snake.state !== "strike")) m.alarm = 0;
+  if (m.alarm > time) {
+    const danger = snake.reach * 1.3 + 0.4 * Z;
+    surf(l, m.s);
+    const toward = (snake.sx - m.ax) * P.tx >= 0 ? 1 : -1;
+    const face = (d) => { if (m.mode === "sit" || m.dir !== d) { snap(m); m.dir = d; m.mode = "walk"; } };
+    if (Math.hypot(m.ax - snake.sx, m.ay - snake.sy) < danger) { face(-toward); m.goal = null; m.scared = time + 0.5; }
+    else if (m.fruit) { face(toward); snap(m); m.act = { kind: "throw", t: 0, spot: null, done: false }; return; }
+    else {
+      const sp = findFruit(m, danger);
+      if (sp) { if (m.mode === "sit") { snap(m); m.mode = "walk"; } m.goal = sp; m.scared = time + 0.3; }
+      else { face(-toward); m.goal = null; m.scared = time + 1; }
+    }
+  }
+  // the snake on the move: keep away from it
+  if (snake.on && snake.state === "travel" && snake.hz > 0 && Math.hypot(snake.hx - m.pts[4], snake.hy - m.pts[5]) < 2.4 * Z) {
+    surf(l, m.s);
+    const away = (m.pts[4] - snake.hx) * P.tx >= 0 ? 1 : -1;
+    if (m.mode === "sit" || away !== m.dir) { snap(m); m.dir = away; m.mode = "walk"; }
+    m.scared = time + 1.2; m.until = Math.max(m.until, time + 1.5);
+  }
+  if (m.mode === "sit") {
+    m.v = 0;
+    if (time > m.lookAt) { m.look = rm() < 0.4 ? -1 : 1; m.lookAt = time + 0.8 + rm() * 2; m.scratch = rm() < 0.4; }
+    if (m.fruit && time > m.eatUntil) { m.fruit = false; m.hungryAt = time + 20 + rm() * 35; }   // finished it
+    if (time > m.until) { snap(m); m.mode = "walk"; if (rm() < 0.35) m.dir = -m.dir; m.until = time + 1.5 + rm() * 4; }
+    return;
+  }
+  const V = (time < m.scared ? 2.8 : 1.15) * Z;
+  m.v += (V - m.v) * Math.min(1, dt * (m.v > V ? 3 : 6));          // speed it landed with takes a while to run off
+  const ds = m.v * dt, ns = m.s + m.dir * ds;
+  m.phase = (m.phase + ds / (0.55 * Z)) % 1;                       // one stride covers 0.55 body lengths
+  const lo = (l.exit ? 1.6 : 1) * RT + 0.7 * Z;                    // as close to the trunk as it goes
+  if (ns > lo + 3 * Z) m.decided = false;
+  if (m.goal) {
+    // on its way to a bunch of fruit
+    const g = m.goal;
+    if (g.l !== l || !fruitLeft(g)) m.goal = null;
+    else if (Math.abs(g.s - m.s) < 0.12 * Z) { m.goal = null; snap(m); m.act = { kind: "pick", t: 0, spot: g, done: false }; return; }
+    else if ((g.s > m.s ? 1 : -1) !== m.dir) { turn(m); return; }
+  }
+
+  if (m.dir > 0 && (ns > l.len - 0.45 * Z || radius(l, clamp(ns / l.len, 0, 1)) < 0.04 * Z)) {
+    if (leap(m)) ;                                                 // wood too thin to carry it: jump, or turn back
+    else if (time < m.scared) m.v = 0;                             // (or, with the snake behind it, cower)
+    else turn(m);
+    m.until = time + 1 + rm() * 3;
+  } else if (m.dir < 0 && ns < lo) {
+    if (l.exit && !m.decided) { m.decided = true; m.leaving = rm() < 0.25; }   // at the trunk: go home, or stay
+    if (!(l.exit && m.leaving)) turn(m);
+    else if (ns < -1.5 * Z) { m.on = false; m.at = time + 5 + rm() * 10; }
+    else m.s = ns;
+  } else {
+    m.s = ns;
+    for (const o of monkeys) {                                     // somebody in the way: turn round
+      if (o === m || !o.on || o.l !== l || (o.mode !== "walk" && o.mode !== "sit")) continue;
+      const gap = (o.s - m.s) * m.dir;
+      if (gap > 0 && gap < 0.9 * Z && time > m.turnOk && ns > lo + Z) { turn(m); m.turnOk = time + 2; }
+    }
+    if (time > m.until && m.s > lo && !m.goal) {
+      const r = rm(), sp = !m.fruit && time > m.hungryAt ? findFruit(m, 0) : null;
+      m.until = time + 1.5 + rm() * 4;
+      if (m.fruit) sitEat(m);
+      else if (sp) m.goal = sp;                                    // hungry, and there is fruit on this bough
+      else if (r < 0.45) leap(m);
+      else if (r < 0.87) {
+        surf(l, m.s);
+        if (Math.abs(P.ty) < 0.4) { snap(m); m.mode = "sit"; m.until = time + 2 + rm() * 5; m.lookAt = 0; }
+      } else turn(m);
+    }
+  }
+}
+
+// Where a foot is during the walk, as [ahead of its resting place, above the
+// bark] in body lengths. For the first 60% of its cycle it is planted: it moves
+// back exactly as fast as the body moves forward, so it stays put on the wood.
+const FOOT = [0, 0];
+function footWalk(p, c) {
+  if (p < 0.6) { FOOT[0] = c + 0.55 * (0.3 - p); FOOT[1] = 0; return; }
+  const u = (p - 0.6) / 0.4;
+  FOOT[0] = c + 0.55 * lerp(-0.3, 0.3, smooth(u));
+  FOOT[1] = 0.08 * Math.sin(Math.PI * u);
+}
+
+function poseGround(m) {
+  const Z = m.S, l = m.l, d = m.dir;
+  surf(l, m.s);
+  A.x = P.x; A.y = P.y;
+  const fx = P.tx * d, fy = P.ty * d, nx = P.nx, ny = P.ny;
+  m.face = fx >= 0 ? 1 : -1;
+  m.fa = Math.atan2(fy, fx);
+  if (m.act && m.act.kind === "throw") {
+    // up on its hind legs: the arm goes back, whips forward, and lets go
+    const t = m.act.t, wind = smooth(clamp(t / 0.26, 0, 1)), sw = smooth(clamp((t - 0.28) / 0.1, 0, 1)), lean = -0.08 * wind + 0.22 * sw;
+    const hx = A.x - fx * 0.02 * Z + nx * (0.3 * Z + m.sq), hy = A.y - fy * 0.02 * Z + ny * (0.3 * Z + m.sq);
+    const sx = hx + (nx * 0.4 + fx * lean) * Z, sy = hy + (ny * 0.4 + fy * lean) * Z;
+    setT(0, hx, hy); setT(1, sx, sy);
+    setT(2, sx + (nx * 0.17 + fx * 0.08) * Z, sy + (ny * 0.17 + fy * 0.08) * Z);
+    setT(3, sx + (fx * 0.26 - nx * 0.12) * Z, sy + (fy * 0.26 - ny * 0.12) * Z);
+    const bx = lerp(lerp(0.1, -0.3, wind), 0.45, sw), by = lerp(lerp(-0.2, 0.32, wind), 0.1, sw);
+    setT(4, sx + (fx * bx + nx * by) * Z, sy + (fy * bx + ny * by) * Z);
+    placeOn(l, m.s, d, 0.1 * Z, 0); setT(5, F.x, F.y);
+    placeOn(l, m.s, d, -0.14 * Z, 0); setT(6, F.x, F.y);
+    HF[0] = fx; HF[1] = fy; BR[0] = -fx; BR[1] = -fy;
+    EH[0] = -fx + nx * 0.5; EH[1] = -fy + ny * 0.5; KH[0] = fx; KH[1] = fy;
+    tailMode = 0;
+    return;
+  }
+  if (m.mode === "sit") {
+    // on its haunches, knees up, tail hanging down
+    const hh = 0.13 * Z + 0.4 * m.sq, hx = A.x - fx * 0.06 * Z + nx * hh, hy = A.y - fy * 0.06 * Z + ny * hh;
+    const sx = hx + (nx * 0.4 + fx * 0.07) * Z, sy = hy + (ny * 0.4 + fy * 0.07) * Z;
+    const ex = sx + (nx * 0.17 + fx * 0.07) * Z, ey = sy + (ny * 0.17 + fy * 0.07) * Z;
+    setT(0, hx, hy); setT(1, sx, sy); setT(2, ex, ey);
+    setT(3, A.x + (fx * 0.2 + nx * 0.25) * Z, A.y + (fy * 0.2 + ny * 0.25) * Z);       // a hand on its knee
+    if (m.fruit) {
+      const c = 0.03 - 0.02 * Math.sin(time * 10);                                       // fruit to its mouth, chewing
+      setT(4, ex + (fx * 0.13 - nx * c) * Z, ey + (fy * 0.13 - ny * c) * Z);
+    } else if (m.scratch) {
+      const c = Math.sin(time * 15);                                                     // the other one scratches its head
+      setT(4, ex + (nx * (0.1 + 0.03 * c) + fx * 0.04 * c) * Z, ey + (ny * (0.1 + 0.03 * c) + fy * 0.04 * c) * Z);
+    } else setT(4, A.x + (fx * 0.13 + nx * 0.2) * Z, A.y + (fy * 0.13 + ny * 0.2) * Z);
+    placeOn(l, m.s, d, 0.22 * Z, 0); setT(5, F.x, F.y);
+    placeOn(l, m.s, d, 0.29 * Z, 0); setT(6, F.x, F.y);
+    const look = m.fruit ? 1 : m.look;
+    HF[0] = fx * look; HF[1] = fy * look; BR[0] = -fx; BR[1] = -fy;
+    EH[0] = -fx - nx * 0.4; EH[1] = -fy - ny * 0.4; KH[0] = nx + fx * 0.3; KH[1] = ny + fy * 0.3;
+    tailMode = 1;
+    return;
+  }
+  // on all fours: diagonal pairs of feet step together
+  const g = smooth(clamp(m.v / Z, 0, 1)), ph = m.phase;             // 0 standing still, 1 walking
+  const bob = 0.012 * Z * Math.sin(2 * TAU * ph) * g;
+  placeOn(l, m.s, d, -0.2 * Z, 0.33 * Z + bob + m.sq); setT(0, F.x, F.y);   // feet stay planted, so sinking bends the legs
+  placeOn(l, m.s, d, 0.2 * Z, 0.32 * Z - bob + m.sq); setT(1, F.x, F.y);
+  const nod = 0.02 * Math.sin(time * 1.9 + m.ph) * (1 - g);
+  setT(2, F.x + (fx * 0.17 + nx * (0.09 + nod)) * Z, F.y + (fy * 0.17 + ny * (0.09 + nod)) * Z);
+  for (let i = 0; i < 4; i++) {
+    const front = i < 2, c = front ? 0.3 : -0.2;
+    footWalk((ph + [0, 0.5, 0.6, 0.1][i]) % 1, c);
+    placeOn(l, m.s, d, lerp(c + (i & 1 ? 0.05 : -0.03), FOOT[0], g) * Z, FOOT[1] * g * Z);
+    setT(3 + i, F.x, F.y);
+  }
+  if (m.act) {                                                     // picking: one hand goes up to the fruit and back
+    const w = Math.sin(Math.PI * clamp(m.act.t / 0.45, 0, 1));
+    fruitPos(m.act.spot, 0);
+    setT(3, lerp(T[6], FP.x, w), lerp(T[7], FP.y, w));
+  }
+  HF[0] = fx; HF[1] = fy; BR[0] = nx; BR[1] = ny;
+  EH[0] = -fx; EH[1] = -fy; KH[0] = fx; KH[1] = fy;
+  tailMode = 0;
+}
+
+function poseVine(m, dt) {
+  const Z = m.S, v = m.vine, ld = v.load, climbing = m.mode === "climb";
+  const rx = Math.sin(ld.th), ry = Math.cos(ld.th);                // the way the vine runs, downward
+  A.x = v.ax + rx * ld.R; A.y = v.ay + ry * ld.R;
+  // The body is a second and third pendulum hung from the hands: the chest
+  // chases the angle of the vine and the hips chase the chest, each on a
+  // spring, so the body lags behind and whips through at the bottom.
+  m.h1v += (90 * angleDiff(ld.th, m.h1) - 11 * m.h1v) * dt; m.h1 += m.h1v * dt;
+  m.h2v += (55 * angleDiff(m.h1, m.h2) - 8 * m.h2v) * dt; m.h2 += m.h2v * dt;
+  const d1x = Math.sin(m.h1), d1y = Math.cos(m.h1), d2x = Math.sin(m.h2), d2y = Math.cos(m.h2);
+  const arm = (climbing ? 0.26 : 0.38) * Z;
+  const sx = A.x + d1x * arm, sy = A.y + d1y * arm;
+  const hx = sx + d2x * 0.42 * Z, hy = sy + d2y * 0.42 * Z;
+  setT(0, hx, hy); setT(1, sx, sy);
+  setT(2, sx - d1x * 0.1 * Z + m.face * 0.09 * Z, sy - d1y * 0.1 * Z);
+  if (climbing) {
+    // hand over hand, feet clamped on the vine below
+    const c = ld.L / (0.13 * Z), sn = Math.sin(c), cs = Math.cos(c);
+    setT(3, A.x - rx * 0.11 * Z * (1 + sn), A.y - ry * 0.11 * Z * (1 + sn));
+    setT(4, A.x - rx * 0.11 * Z * (1 - sn), A.y - ry * 0.11 * Z * (1 - sn));
+    setT(5, A.x + rx * (0.8 + 0.05 * cs) * Z, A.y + ry * (0.8 + 0.05 * cs) * Z);
+    setT(6, A.x + rx * (0.86 - 0.05 * cs) * Z, A.y + ry * (0.86 - 0.05 * cs) * Z);
+  } else {
+    // both hands on the vine; the legs kick forward on the way through
+    const kick = clamp((ld.om * ld.R) / (2.2 * Z), -1, 1), ex = Math.cos(m.h2), ey = -Math.sin(m.h2);
+    setT(3, A.x, A.y); setT(4, A.x - rx * 0.1 * Z, A.y - ry * 0.1 * Z);
+    setT(5, hx + (d2x * 0.3 + ex * (0.2 * kick + 0.07 * m.face)) * Z, hy + (d2y * 0.3 + ey * (0.2 * kick + 0.07 * m.face)) * Z);
+    setT(6, hx + (d2x * 0.26 + ex * (0.26 * kick - 0.05 * m.face)) * Z, hy + (d2y * 0.26 + ey * (0.26 * kick - 0.05 * m.face)) * Z);
+  }
+  HF[0] = m.face; HF[1] = 0; BR[0] = -m.face; BR[1] = 0;
+  EH[0] = -m.face; EH[1] = 0.3; KH[0] = m.face; KH[1] = -0.2;
+  tailMode = 2;
+}
+
+// In the air its middle is a thrown stone: x = x0 + vx t, y = y0 + vy t + g t²/2,
+// and nothing changes that until it lands. Around that point the body turns
+// from the tilt it left with to the one it will arrive with, leaning along its
+// path on the way. Feet stay behind for the push-off; hands go out ahead for
+// the catch, and it is the arms that make up for a vine that has drifted.
+function poseFly(m, dt) {
+  const Z = m.S, f = m.fly;
+  f.t += dt;
+  const tt = Math.min(f.t, f.T), u = tt / f.T, e = smooth(u);
+  A.x = f.x0 + f.vx * tt; A.y = f.y0 + f.vy * tt + 0.5 * GRAV * tt * tt;
+  let a1, h0x, h0y, h1x, h1y, g0x = 0, g0y = 0, g1x = 0, g1y = 0;
+  if (f.vine) {
+    vinePoint(f.vine, f.vine.grip);
+    a1 = Math.atan2(-Math.cos(f.h0), -Math.sin(f.h0));
+    h0x = Q.x; h0y = Q.y; h1x = Q.x; h1y = Q.y - 0.1 * Z;
+  } else {
+    surf(f.l, f.s);
+    const d = f.vx * P.tx >= 0 ? 1 : -1;
+    a1 = Math.atan2(P.ty * d, P.tx * d);
+    placeOn(f.l, f.s, d, 0.3 * Z, 0); h0x = F.x; h0y = F.y;
+    placeOn(f.l, f.s, d, 0.36 * Z, 0); h1x = F.x; h1y = F.y;
+    placeOn(f.l, f.s, d, -0.2 * Z, 0); g0x = F.x; g0y = F.y;
+    placeOn(f.l, f.s, d, -0.26 * Z, 0); g1x = F.x; g1y = F.y;
+  }
+  let a = f.a0 + angleDiff(a1, f.a0) * e;
+  const lean = angleDiff(Math.atan2(f.vy + GRAV * tt, f.vx), a);
+  a += lean * Math.max(0, Math.cos(lean)) * Math.sin(Math.PI * u) * 0.7;
+  const ux = Math.cos(a), uy = Math.sin(a);
+  let px = -uy, py = ux;                                           // the belly side
+  if (px * m.face * 0.3 + py < 0) { px = -px; py = -py; }
+  const hx = A.x - ux * 0.21 * Z, hy = A.y - uy * 0.21 * Z, sx = A.x + ux * 0.21 * Z, sy = A.y + uy * 0.21 * Z;
+  setT(0, hx, hy); setT(1, sx, sy);
+  setT(2, sx + (ux * 0.15 - px * 0.07) * Z, sy + (uy * 0.15 - py * 0.07) * Z);
+  const wh = smooth(clamp((u - 0.45) / 0.45, 0, 1));               // reaching for the catch
+  setT(3, lerp(sx + (ux * 0.4 + px * 0.08) * Z, h0x, wh), lerp(sy + (uy * 0.4 + py * 0.08) * Z, h0y, wh));
+  setT(4, lerp(sx + (ux * 0.36 + px * 0.16) * Z, h1x, wh), lerp(sy + (uy * 0.36 + py * 0.16) * Z, h1y, wh));
+  const w0 = 1 - smooth(clamp(tt / 0.14, 0, 1)), wf = smooth(clamp((u - 0.6) / 0.4, 0, 1));
+  if (f.vine) { g0x = hx + (px * 0.1 - ux * 0.3) * Z; g0y = hy + (py * 0.1 - uy * 0.3) * Z; g1x = g0x + px * 0.08 * Z; g1y = g0y + py * 0.08 * Z; }
+  const t0x = hx + (px * 0.27 - ux * 0.1) * Z, t0y = hy + (py * 0.27 - uy * 0.1) * Z;   // tucked up in mid-air
+  const t1x = hx + (px * 0.3 - ux * 0.02) * Z, t1y = hy + (py * 0.3 - uy * 0.02) * Z;
+  setT(5, lerp(lerp(t0x, f.push[0], w0), g0x, wf), lerp(lerp(t0y, f.push[1], w0), g0y, wf));
+  setT(6, lerp(lerp(t1x, f.push[2], w0), g1x, wf), lerp(lerp(t1y, f.push[3], w0), g1y, wf));
+  HF[0] = ux + m.face * 0.6; HF[1] = uy; BR[0] = -px; BR[1] = -py;
+  EH[0] = px; EH[1] = py; KH[0] = ux + px * 0.4; KH[1] = uy + py * 0.4;
+  tailMode = 2;
+}
+
+// Two-bone inverse kinematics: a limb rooted at (rx,ry) reaches for (tx,ty); the
+// joint bends toward the side (px,py) points to. Writes root, joint and tip.
+function solveLeg(out, rx, ry, tx, ty, l1, l2, px, py) {
+  let dx = tx - rx, dy = ty - ry;
+  const d = Math.hypot(dx, dy) || 1e-3;
+  const dd = clamp(d, Math.abs(l1 - l2) + 0.01, l1 + l2 - 0.01);  // can't reach further than the limb is long
+  dx /= d; dy /= d;
+  const a = (l1 * l1 + dd * dd - l2 * l2) / (2 * dd), h = Math.sqrt(Math.max(0, l1 * l1 - a * a));
+  const sgn = -dy * px + dx * py < 0 ? -1 : 1;
+  out[0] = rx; out[1] = ry;
+  out[2] = rx + dx * a - dy * h * sgn; out[3] = ry + dy * a + dx * h * sgn;
+  out[4] = rx + dx * dd; out[5] = ry + dy * dd;
+}
+
+function finishPose(m, dt) {
+  const Z = m.S, p = m.pts;
+  if (m.fresh) m.blend = 1;
+  if (m.blend < 1) {
+    m.blend = Math.min(1, m.blend + dt / 0.22);
+    const w = smooth(m.blend);
+    for (let i = 0; i < 14; i += 2) {
+      p[i] = A.x + lerp(m.old[i], T[i] - A.x, w);
+      p[i + 1] = A.y + lerp(m.old[i + 1], T[i + 1] - A.y, w);
+    }
+  } else p.set(T);
+  m.ax = A.x; m.ay = A.y;
+
+  const k = m.fresh ? 1 : Math.min(1, dt * 14);
+  m.hfx += (HF[0] - m.hfx) * k; m.hfy += (HF[1] - m.hfy) * k;
+  m.brx += (BR[0] - m.brx) * k; m.bry += (BR[1] - m.bry) * k;
+  m.ehx += (EH[0] - m.ehx) * k; m.ehy += (EH[1] - m.ehy) * k;
+  m.khx += (KH[0] - m.khx) * k; m.khy += (KH[1] - m.khy) * k;
+  solveLeg(m.arms[0], p[2], p[3], p[6], p[7], 0.24 * Z, 0.24 * Z, m.ehx, m.ehy);
+  solveLeg(m.arms[1], p[2], p[3], p[8], p[9], 0.24 * Z, 0.24 * Z, m.ehx, m.ehy);
+  solveLeg(m.legs[0], p[0], p[1], p[10], p[11], 0.22 * Z, 0.24 * Z, m.khx, m.khy);
+  solveLeg(m.legs[1], p[0], p[1], p[12], p[13], 0.22 * Z, 0.24 * Z, m.khx, m.khy);
+
+  // which way the back faces: square to the spine
+  let ux = p[2] - p[0], uy = p[3] - p[1];
+  const ul = Math.hypot(ux, uy) || 1;
+  ux /= ul; uy /= ul;
+  let bx = -uy, by = ux;
+  if (bx * m.brx + by * m.bry < 0) { bx = -bx; by = -by; }
+  m.bkx = bx; m.bky = by;
+
+  // tail: every joint chases a target angle, the far ones more lazily, so it
+  // lags behind the body and whips about when the monkey does
+  const beta = Math.atan2(-uy, -ux);                               // straight out behind
+  const sg = uy * bx - ux * by >= 0 ? 1 : -1;                      // which way round is "toward the back"
+  let x = p[0] - ux * 0.05 * Z, y = p[1] - uy * 0.05 * Z;
+  m.tx[0] = x; m.ty[0] = y;
+  for (let j = 0; j < NT; j++) {
+    const u = j / (NT - 1);
+    let want;
+    if (tailMode === 0) want = beta + sg * (lerp(1.25, -1, u) + 0.12 * Math.sin(2 * TAU * m.phase - u * 3));
+    else if (tailMode === 1) {
+      const back = m.fa + Math.PI;                                 // over the edge of the bough, then straight down
+      want = back + angleDiff(Math.PI / 2, back) * smooth(clamp(u / 0.3, 0, 1)) + 0.22 * Math.sin(time * 1.5 + m.ph) * u
+        + m.face * 1.4 * smooth(Math.max(0, (u - 0.65) / 0.35));
+    } else want = beta + sg * 1.5 * smooth(Math.max(0, (u - 0.5) / 0.5));
+    if (!m.tailInit) m.ta[j] = want;
+    else m.ta[j] += angleDiff(want, m.ta[j]) * Math.min(1, dt * lerp(18, 6, u));
+    x += Math.cos(m.ta[j]) * ((0.95 * Z) / NT); y += Math.sin(m.ta[j]) * ((0.95 * Z) / NT);
+    m.tx[j + 1] = x; m.ty[j + 1] = y;
+  }
+  m.tailInit = true; m.fresh = false;
+}
+
+function stepMonkey(m, dt) {
+  if (!m.on) {
+    if (time < m.at || !limbs.length) return;
+    spawnMonkey(m);
+  }
+  if (m.mode === "fly") logicFly(m);
+  else if (m.mode === "swing" || m.mode === "climb") logicVine(m, dt);
+  else logicGround(m, dt);
+  if (!m.on) return;
+  if (m.mode === "fly") poseFly(m, dt);
+  else if (m.mode === "swing" || m.mode === "climb") poseVine(m, dt);
+  else poseGround(m);
+  finishPose(m, dt);
+}
+
+// ---------- snake ----------
+// The snake follows a track: in lazy bends across the forest floor, then round
+// and round the right-hand trunk and up into the canopy (and, next time, back
+// down again). Like a real snake it does not wriggle on the spot: the bends
+// are part of the track and stay where they are, while the body flows through
+// them, every part of it passing where the head has been.
+const SK = 46;                            // spine points
+const NS = 13;                            // how many of them, from the nose back, make up the neck it strikes with
+const rs = mulberry(SEED ^ 0x2545f491);
+const snake = {
+  on: false, at: 0, way: -1, L: 600, d: 0, v: 0, pauseUntil: 0, nextPause: 0, raise: 0, tongue: 0, tongueAt: 0,
+  cx: 0, R: 0, c: 0, rho: 1, D1: 0, Dend: 0, yb: 0,
+  x: new Float32Array(SK), y: new Float32Array(SK), z: new Float32Array(SK),   // z: 1 facing us, below 0 round the back of the tree
+  hx: 0, hy: 0, hz: 0,
+  state: "travel", lurked: false, lurkUntil: 0, strikeAt: 0, st: 0, struck: false, neck: 0, victim: null, tx: 0, ty: 0,
+  sx: 0, sy: 0, reach: 100, by: 0, fallT: 0,   // (sx, sy): where the neck leaves the tree
+  px: new Float32Array(SK), py: new Float32Array(SK),
+};
+
+// The point `d` px along the track.
+const TR = { x: 0, y: 0, z: 1 };
+function track(d) {
+  const s = snake;
+  if (d <= s.D1) {
+    const fade = clamp((s.D1 - d) / (s.L * 0.15), 0, 1);           // straightens out as it reaches the tree
+    TR.x = d; TR.z = 1;
+    TR.y = floorY(d) + H * 0.028 + Math.sin((d * TAU) / (s.L * 0.36)) * s.L * 0.016 * fade - (1 - fade) * (floorY(d) - floorY(s.D1));
+    return;
+  }
+  // a helix: across the front of the trunk, round the back, a little higher each turn
+  const phi = -Math.PI / 2 + (d - s.D1) / s.rho;
+  TR.x = s.cx + s.R * Math.sin(phi); TR.y = s.yb - s.c * (phi + Math.PI / 2); TR.z = Math.cos(phi);
+}
+
+// A monkey the snake has gone for leaps back out of the way.
+function startle(m) {
+  if (!m || !m.on || (m.mode !== "walk" && m.mode !== "sit")) return;
+  snap(m);
+  surf(m.l, m.s);
+  m.dir = (m.ax - snake.sx) * P.tx >= 0 ? 1 : -1;
+  if (m.jumpC && m.jumpC.vine) m.jumpC.vine.rider = null;
+  m.mode = "walk"; m.act = null; m.goal = null; m.jumpC = null;
+  m.v = 3.2 * m.S; m.sqv = 2.4 * m.S; m.scared = time + 0.8;
+  if (m.fruit) { m.fruit = false; splat(m.pts[8], m.pts[9]); }     // and drops whatever it was eating
+}
+
+// Hit by a fruit: it loses its grip. From here on the spine is a rope of
+// particles like the vines, falling under gravity and piling up on the ground.
+function knockDown(ix, iy) {
+  const s = snake;
+  s.state = "fall"; s.fallT = 0; s.neck = 0;
+  for (let i = 0; i < SK; i++) {
+    const k = i < 8 ? 0.3 * (1 - i / 8) : 0;                       // the head end takes the blow
+    s.px[i] = s.x[i] - (-70 + ix * k) / 30; s.py[i] = s.y[i] - (-30 + iy * k) / 30;
+    s.z[i] = 1;
+  }
+  for (const m of monkeys) if (m.alarm > time) { m.alarm = 0; m.sqv = 2.6 * m.S; }   // a hop of triumph
+}
+
+function stepSnake(dt) {
+  const s = snake;
+  if (!s.on) {
+    if (time < s.at) return;
+    s.on = true; s.way = -s.way; s.state = "travel"; s.neck = 0;
+    s.lurked = rs() < 0.3 && !params.has("snake");                  // some trips it just passes through
+    s.d = s.way > 0 ? -20 : s.Dend;
+    s.v = 0; s.pauseUntil = 0; s.nextPause = time + 5 + rs() * 8;
+  }
+  const seg = s.L / (SK - 1), { x, y, z, px, py } = s;
+  const ground = (i) => floorY(x[i]) + H * 0.028;
+
+  if (s.state === "fall") {
+    s.fallT += dt;
+    for (let i = 0; i < SK; i++) {
+      const vx = (x[i] - px[i]) * 0.99, vy = (y[i] - py[i]) * 0.99;
+      px[i] = x[i]; py[i] = y[i];
+      x[i] += vx; y[i] += vy + GRAV * dt * dt;
+    }
+    for (let it = 0; it < 10; it++) {
+      for (let i = 1; i < SK; i++) {
+        const dx = x[i] - x[i - 1], dy = y[i] - y[i - 1], d = Math.hypot(dx, dy) || 1e-3, e = ((d - seg) / d) * 0.5;
+        x[i - 1] += dx * e; y[i - 1] += dy * e; x[i] -= dx * e; y[i] -= dy * e;
+      }
+      for (let i = 0; i < SK; i++) {
+        const gy = ground(i);
+        if (y[i] > gy) { y[i] = gy; py[i] = gy; px[i] = x[i] - (x[i] - px[i]) * 0.6; }   // the ground stops it and drags at it
+      }
+    }
+    s.hx = x[0]; s.hy = y[0]; s.hz = 1;
+    if (s.fallT > 2.6) { s.state = "flee"; s.v = 0; }
+    return;
+  }
+  if (s.state === "flee") {
+    // Had enough. The head makes for the edge of the screen and the body
+    // follows it like a chain, each point dragged along behind the one in front.
+    s.v += (s.L * 0.24 - s.v) * Math.min(1, dt * 2);
+    x[0] -= s.v * dt;
+    y[0] += (ground(0) + Math.sin((x[0] * TAU) / (s.L * 0.3)) * s.L * 0.02 - y[0]) * Math.min(1, dt * 5);
+    for (let i = 1; i < SK; i++) {
+      const dx = x[i] - x[i - 1], dy = y[i] - y[i - 1], d = Math.hypot(dx, dy) || 1e-3;
+      x[i] = x[i - 1] + (dx / d) * seg; y[i] = Math.min(y[i - 1] + (dy / d) * seg, ground(i) + s.L * 0.02);
+    }
+    s.hx = x[0]; s.hy = y[0]; s.hz = 1;
+    if (x[SK - 1] < -30 && x[0] < -30) { s.on = false; s.way = -1; s.at = time + 14 + rs() * 16; }
+    return;
+  }
+
+  // now and then it stops, lifts its head and tastes the air
+  const free = s.state === "travel" && s.neck < 0.05, moving = free && time > s.pauseUntil;
+  if (moving && time > s.nextPause && s.hz > 0.3 && s.hx > 30 && s.hy > 30) {
+    s.pauseUntil = time + 1.5 + rs() * 2.5; s.nextPause = s.pauseUntil + 7 + rs() * 10;
+  }
+  s.v += ((moving ? s.L * 0.13 : 0) - s.v) * Math.min(1, dt * 3);
+  s.d += s.way * s.v * dt;
+  s.raise += ((free && !moving && s.d < s.D1 - s.L * 0.1 ? 1 : 0) - s.raise) * Math.min(1, dt * 3);
+  if (time > s.tongueAt) { s.tongue = 0.3; s.tongueAt = time + (moving ? 1.5 + rs() * 3 : 0.5 + rs() * 0.7); }
+  s.tongue -= dt;
+
+  for (let i = 0; i < SK; i++) { track(s.d - s.way * i * seg); x[i] = TR.x; y[i] = TR.y; z[i] = TR.z; }
+  for (let pass = 0; pass < 2; pass++) {                           // round off the corner where floor meets tree
+    let ax = x[0], ay = y[0], az = z[0];
+    for (let i = 1; i < SK - 1; i++) {
+      const nx = (ax + 2 * x[i] + x[i + 1]) / 4, ny = (ay + 2 * y[i] + y[i + 1]) / 4, nz = (az + 2 * z[i] + z[i + 1]) / 4;
+      ax = x[i]; ay = y[i]; az = z[i];
+      x[i] = nx; y[i] = ny; z[i] = nz;
+    }
+  }
+  for (let i = 0; i < 9; i++) y[i] -= s.raise * s.L * 0.05 * Math.pow(1 - i / 9, 2);
+
+  // Lying in wait. Once on each trip, where the lower bough meets the trunk,
+  // it stops with its neck drawn back off the tree, and strikes at any monkey
+  // that comes within reach. The monkeys take no notice of it until it does.
+  s.sx = x[NS]; s.sy = y[NS]; s.reach = NS * seg * 0.9;
+  if (s.state === "travel" && !s.lurked && z[NS] > 0.15 && s.sx < s.cx - 0.2 * s.R && s.sy > s.by - 1.6 * S && s.sy < s.by - 0.15 * S) {
+    s.state = "lurk"; s.lurked = true; s.lurkUntil = time + 14 + rs() * 8; s.strikeAt = time + 2;
+  }
+  s.neck += ((s.state !== "travel" ? 1 : 0) - s.neck) * Math.min(1, dt * 3);
+  let ax = s.sx - s.reach * (0.55 + 0.06 * Math.sin(time * 0.9)), ay = s.sy - s.reach * (0.4 + 0.05 * Math.sin(time * 1.3)), out = 0;
+  if (s.state === "lurk") {
+    if (time > s.lurkUntil) s.state = "travel";
+    else if (time > s.strikeAt)
+      for (const m of monkeys) {
+        if (!m.on || (m.mode !== "walk" && m.mode !== "sit") || Math.hypot(m.pts[4] - s.sx, m.pts[5] - s.sy) > s.reach * 0.97) continue;
+        s.state = "strike"; s.st = 0; s.struck = false; s.victim = m; s.tx = m.pts[4]; s.ty = m.pts[5];
+        break;
+      }
+  }
+  if (s.state === "strike") {
+    // out in an eighth of a second, back in rather less of a hurry
+    s.st += dt; s.tongue = 0.2;
+    out = s.st < 0.13 ? smooth(s.st / 0.13) : s.st < 0.22 ? 1 : 1 - smooth(clamp((s.st - 0.22) / 0.4, 0, 1));
+    ax = lerp(ax, s.tx, out); ay = lerp(ay, s.ty, out);
+    if (!s.struck && s.st > 0.07) {
+      s.struck = true;
+      startle(s.victim);
+      for (const m of monkeys)                                     // everyone nearby has seen it now
+        if (m.on && (m.mode === "walk" || m.mode === "sit") && Math.hypot(m.ax - s.sx, m.ay - s.sy) < 8 * S) m.alarm = time + 6;
+    }
+    if (s.st > 0.62) { s.state = "lurk"; s.strikeAt = time + 2.5 + rs() * 2.5; }
+  }
+  if (s.neck > 0.01) {
+    // the neck: a curve from the tree to the head, arched when drawn back, straight at full stretch
+    const mx = (s.sx + ax) / 2, my = (s.sy + ay) / 2 - s.reach * 0.3 * (1 - out);
+    for (let i = 0; i < NS; i++) {
+      const u = 1 - i / NS, a = (1 - u) * (1 - u), b = 2 * u * (1 - u), c = u * u;
+      x[i] = lerp(x[i], a * s.sx + b * mx + c * ax, s.neck);
+      y[i] = lerp(y[i], a * s.sy + b * my + c * ay, s.neck);
+      z[i] = lerp(z[i], 1, s.neck);
+    }
+  }
+  s.hx = x[0]; s.hy = y[0]; s.hz = z[0];
+  if (s.way > 0 ? s.d > s.Dend + s.L : s.d < -s.L - 30) { s.on = false; s.at = time + 8 + rs() * 14; }
+}
+
+// Half-width of the body at position s along it (0 nose, 1 tail tip), relative to mid-body.
+function snakeW(s) {
+  if (s < 0.03) return 1.25;
+  if (s < 0.08) return lerp(1.25, 0.85, (s - 0.03) / 0.05);
+  if (s < 0.2) return lerp(0.85, 1, (s - 0.08) / 0.12);
+  if (s < 0.55) return 1;
+  return lerp(1, 0.12, Math.pow((s - 0.55) / 0.45, 1.3));
+}
+
+// ---------- putting it all in place ----------
+function build() {
+  limbs.length = vines.length = clumps.length = ferns.length = motes.length = bits.length = fruits.length = shots.length = 0;
+  S = clamp(Math.min(W, H) * 0.17, 64, 165);
+  RT = clamp(Math.min(W, H) * 0.075, 30, 85);
+  GRAV = 2.6 * H;                                                  // tuned so a long vine takes about 2.5 s per swing
+  trunks[0].x = RT * 0.5; trunks[1].x = W - RT * 1.5;
+
+  const rnd = mulberry(SEED);
+  const A1 = bough(trunks[0].x, H * 0.37, -0.1, W * 0.46, RT * 0.5, true, rnd);            // upper left
+  const B1 = bough(trunks[1].x, H * 0.64, Math.PI + 0.08, W * 0.5, RT * 0.5, false, rnd); // lower right
+  pose(0);
+
+  // leaves, in clumps along the thinner wood
+  for (const l of limbs) {
+    for (let k = Math.round(l.n * 0.3); k <= l.n; k += 2 + ((rnd() * 3) | 0)) {
+      const r = S * (0.2 + rnd() * 0.22) * (k > l.n - 3 ? 1.4 : 1);
+      clumps.push({ l, at: k, ox: (rnd() - 0.5) * r, oy: rnd() < 0.7 ? -r * (0.4 + rnd() * 0.5) : r * 0.6, r, seed: (rnd() * 1e6) | 0, ph: rnd() * TAU, flower: rnd() < 0.4 });
+    }
+    clumps.push({ l, at: l.n, ox: 0, oy: -S * 0.1, r: S * 0.42, seed: (rnd() * 1e6) | 0, ph: rnd() * TAU, flower: true });
+  }
+
+  // fruit, each bunch in a tuft of leaves; one bunch grows right by the trunk the snake climbs
+  for (const [l, spots] of [[A1, [0.36, 0.74]], [B1, [(RT + 1.05 * S) / B1.len, 0.5, 0.8]]])
+    for (const f of spots) {
+      const at = clamp(Math.round(f * l.n), 1, l.n - 1), n = 2 + ((rnd() * 2) | 0);
+      fruits.push({ l, at, s: at * l.seg, n, back: new Float32Array(n), seed: (rnd() * 1e6) | 0 });
+      clumps.push({ l, at, ox: 0, oy: -radius(l, at / l.n) - S * 0.12, r: S * 0.3, seed: (rnd() * 1e6) | 0, ph: rnd() * TAU, flower: false });
+    }
+
+  // thin leafy creepers and a couple of looping lianas, for show
+  for (let i = 0; i < 9; i++) makeVine({ x: W * (0.1 + 0.8 * ((i + rnd()) / 9)), y: -10, len: H * (0.1 + rnd() * 0.3) });
+  makeVine({ x: W * 0.28, y: -10, bx: W * 0.5, by: -10, len: W * 0.26 });
+  makeVine({ x: W * 0.8, y: -10, bx: W + 10, by: H * 0.22, len: W * 0.3 });
+  // the ones to swing on: two from the canopy, two from under the left bough
+  makeVine({ x: W * 0.58, y: -1.5 * S, len: H * 0.42 + 1.5 * S, grip: H * 0.2 + 1.5 * S });
+  makeVine({ x: W * 0.73, y: -1.5 * S, len: H * 0.52 + 1.5 * S, grip: H * 0.3 + 1.5 * S });
+  for (const fx of [0.19, 0.3])
+    makeVine({ limb: A1, at: clamp(Math.round(((W * fx - A1.x0) / A1.len) * A1.n), 1, A1.n - 1), len: H * 0.32, grip: H * 0.2 });
+  for (let i = 0; i < 50; i++) stepVines(1 / 30);                  // let them settle
+
+  for (let i = 0, n = clamp(Math.round(W / 240), 3, 8); i < n; i++) {
+    const x = W * ((i + 0.15 + rnd() * 0.7) / n), fronds = [];
+    for (let j = 0, c = 5 + ((rnd() * 3) | 0); j < c; j++)
+      fronds.push({ ang: -Math.PI / 2 + ((j + 0.2 + rnd() * 0.6) / c - 0.5) * 1.9, len: S * (0.3 + rnd() * 0.35), ph: rnd() * TAU });
+    ferns.push({ x, y: floorY(x) + H * 0.02, fronds, shade: 0.75 + rnd() * 0.4 });
+  }
+  for (let i = 0, n = clamp(Math.round((W * H) / 16000), 20, 140); i < n; i++)
+    motes.push({ x: Math.random() * W, y: Math.random() * H * 0.9, z: Math.random(), ph: Math.random() * TAU });
+
+  monkeys.forEach((m, i) => { m.on = false; m.at = time + [1, 4, 9][i]; });
+  const s = snake;
+  s.on = false; s.way = -1; s.state = "travel"; s.by = B1.y0 - B1.r0; s.at = time + (params.has("snake") ? 0 : 5);   // add ?snake to the URL to see it straight away
+  s.L = clamp(Math.min(W, H) * 0.8, 340, 900);
+  s.cx = trunks[1].x; s.R = RT + s.L * 0.01; s.c = (3.2 * RT) / TAU; s.rho = Math.hypot(s.R, s.c);
+  s.D1 = s.cx - s.R; s.yb = floorY(s.D1) + H * 0.028;
+  s.Dend = s.D1 + (s.rho * (s.yb + s.L * 0.1)) / s.c;
+}
+
+// ---------- renderer (everything snaps to the character grid here) ----------
+const renderer = {
+  canvas: null, ctx: null, bg: null, dpr: 1,
+  cw: 10, ch: 15, cols: 0, rows: 0, font: "monospace",
+  flag: new Uint8Array(0), glyph: new Uint16Array(0),
+  colour: new Uint32Array(0), fill: new Uint32Array(0),
+  stampBack: null, stampFront: null,
+
+  resize(w, h, dpr) {
+    this.dpr = dpr;
+    this.cw = clamp(Math.round(w / 260), 4, 8);
+    this.ch = Math.round(this.cw * 1.5);
+    this.cols = Math.ceil(w / this.cw);
+    this.rows = Math.ceil(h / this.ch);
+    const n = this.cols * this.rows;
+    this.flag = new Uint8Array(n); this.glyph = new Uint16Array(n);
+    this.colour = new Uint32Array(n); this.fill = new Uint32Array(n);
+    this.canvas.width = Math.round(w * dpr);
+    this.canvas.height = Math.round(h * dpr);
+    this.bg.width = this.canvas.width; this.bg.height = this.canvas.height;
+    this.paintBackdrop(w, h, dpr);
+  },
+
+  // Static backdrop: misty light coming down through a gap in the canopy,
+  // three layers of foliage and far-off trunks fading into it, the forest
+  // floor, and the cell grid.
+  paintBackdrop(w, h, dpr) {
+    const b = this.bg.getContext("2d");
+    b.setTransform(dpr, 0, 0, dpr, 0, 0);
+    b.fillStyle = `rgb(${BG})`;
+    b.fillRect(0, 0, w, h);
+    const { cw, ch, cols, rows } = this;
+    b.font = `600 ${Math.round(ch * 0.78)}px ${this.font}`;
+    b.textAlign = "center";
+    b.textBaseline = "middle";
+    const rnd = mulberry(SEED + 77);
+    const far = [];
+    for (let i = 0; i < 11; i++)
+      far.push({ x: rnd() * w, hw: Math.max(3, ((i < 7 ? 5 + rnd() * 10 : 10 + rnd() * 18) * w) / 1400), lean: (rnd() - 0.5) * 0.12, near: i >= 7 });
+    const lx = w * 0.56, ly = -h * 0.06, STEPS = 8;
+    // how leafy a spot is in layer k: lumpy noise, thicker toward the sides, the top and the ground
+    const leafy = (k, x, y) => {
+      const sc = LAYERS[k].scale;
+      return noise2(x / sc, y / (sc * 0.72), SEED + 30 + k) * 0.68 + noise2(x / (sc * 0.28), y / (sc * 0.28), SEED + 40 + k) * 0.32
+        + 0.3 * Math.pow(Math.abs(x / w - 0.54) * 2, 2)
+        + (k ? 0.3 : 0.16) * Math.pow(1 - y / h, 2) * clamp(Math.abs(x / w - 0.54) * 3, 0.15, 1)
+        + 0.22 * Math.pow(y / h, 3);
+    };
+    for (let r = 0; r < rows; r++)
+      for (let c = 0; c < cols; c++) {
+        const x = (c + 0.5) * cw, y = (r + 0.5) * ch;
+        // the light: a glow around the gap, stepped like contour bands, and slanting shafts
+        const d = Math.hypot(((x - lx) / w) * 1.25, (y - ly) / h);
+        let t = Math.pow(clamp(1 - d / 0.95, 0, 1), 1.6);
+        const beam = noise1((x - lx + (y - ly) * 0.45) / (w * 0.045), SEED + 3);
+        t += 0.22 * smooth(clamp((beam - 0.52) / 0.2, 0, 1)) * clamp(1.1 - y / (h * 0.85), 0, 1) * clamp(t * 3, 0, 1);
+        const band = clamp(Math.round(t * STEPS + (hash(c, r, 21) - 0.5) * 0.7), 0, STEPS) / STEPS;
+        let cr = lerp(BG[0], MIST[0], band), cg = lerp(BG[1], MIST[1], band), cb = lerp(BG[2], MIST[2], band);
+        let mark = 0;
+        const layer = (k) => {
+          const L = LAYERS[k], m = leafy(k, x, y);
+          if (m <= L.cut) return;
+          const top = leafy(k, x, y - ch * 1.5) <= L.cut;          // the upper edge of a mass catches the light
+          const kk = (0.8 + 0.4 * hash(c, r, 50 + k)) * (top ? 1.5 : 1) * (1 - 0.35 * clamp((m - L.cut) * 4, 0, 1));
+          cr = lerp(L.col[0] * kk, cr, L.haze); cg = lerp(L.col[1] * kk, cg, L.haze); cb = lerp(L.col[2] * kk, cb, L.haze);
+          mark = 1;
+        };
+        const trunk = (near) => {
+          for (const tr of far) {
+            if (tr.near !== near) continue;
+            const u = (x - tr.x - tr.lean * (y - h / 2)) / tr.hw;
+            if (Math.abs(u) > 1) continue;
+            const kk = (0.75 + 0.3 * u * (tr.x < lx ? 1 : -1)) * (0.9 + 0.2 * hash(c, r, 60)), hz = near ? 0.25 : 0.55;
+            cr = lerp(FAR_TRUNK[0] * kk, cr, hz); cg = lerp(FAR_TRUNK[1] * kk, cg, hz); cb = lerp(FAR_TRUNK[2] * kk, cb, hz);
+            mark = 2;
+          }
+        };
+        layer(0); trunk(false); layer(1); trunk(true); layer(2);
+        const fy = floorY(x);
+        if (y > fy) {
+          const kk = 0.8 + 0.4 * hash(c, r, 61);
+          const col = y - fy < ch ? MOSS_TOP : EARTH;
+          cr = col[0] * kk; cg = col[1] * kk; cb = col[2] * kk; mark = 3;
+        }
+        b.fillStyle = rgb(cr, cg, cb);
+        b.fillRect(c * cw, r * ch, cw, ch);
+        const hh = hash(c, r, 70);
+        if (mark === 1 && hh < 0.22) { b.fillStyle = rgb(cr * 1.5 + 10, cg * 1.5 + 12, cb * 1.5 + 8); b.fillText("\"'`,;"[(hh * 1000) % 5 | 0], x, y); }
+        else if (mark === 2 && hh < 0.3) { b.fillStyle = rgb(cr * 0.7, cg * 0.7, cb * 0.7); b.fillText("|", x, y); }
+        else if (mark === 3 && hh < 0.12) { b.fillStyle = rgb(cr * 1.7 + 8, cg * 1.7 + 10, cb * 1.6 + 6); b.fillText(",.'`"[(hh * 1000) & 3], x, y); }
+      }
+    // creepers hanging far back
+    for (let i = 0; i < 16; i++) {
+      const c = (rnd() * cols) | 0, len = (rows * (0.1 + rnd() * 0.45)) | 0;
+      b.fillStyle = `rgba(20,44,32,${(0.35 + rnd() * 0.4).toFixed(2)})`;
+      for (let r = 0; r < len; r++) b.fillText(hash(c, r, 80) < 0.2 ? ")" : "|", (c + 0.5) * cw, (r + 0.5) * ch);
+    }
+    // cell borders: hairlines one device pixel wide on every cell boundary
+    b.setTransform(1, 0, 0, 1, 0, 0);
+    b.strokeStyle = GRID;
+    b.lineWidth = 1;
+    b.beginPath();
+    for (let c = 0; c <= cols; c++) {
+      const x = Math.round(c * cw * dpr) + 0.5;
+      b.moveTo(x, 0); b.lineTo(x, h * dpr);
+    }
+    for (let r = 0; r <= rows; r++) {
+      const y = Math.round(r * ch * dpr) + 0.5;
+      b.moveTo(0, y); b.lineTo(w * dpr, y);
+    }
+    b.stroke();
+  },
+
+  // The two big trunks and the canopy overhead never move, so their cells are
+  // worked out once and stamped into every frame.
+  cache() {
+    const { cw, ch, cols, rows } = this;
+    const make = () => ({ idx: [], fill: [], glyph: [], colour: [] });
+    const add = (st, i, fill, glyph, colour) => { st.idx.push(i); st.fill.push(fill); st.glyph.push(glyph); st.colour.push(colour); };
+    const back = make(), front = make();
+    for (const tr of trunks) {
+      const lit = tr.x < W / 2 ? 1 : -1;                           // the light is toward the middle
+      for (let r = 0; r < rows; r++) {
+        const y = (r + 0.5) * ch, rad = trunkR(y);
+        if (y > floorY(tr.x) + ch * 2) break;
+        for (let c = Math.max(0, Math.floor((tr.x - rad) / cw)); c <= Math.min(cols - 1, Math.floor((tr.x + rad) / cw)); c++) {
+          const x = (c + 0.5) * cw, u = (x - tr.x) / rad;
+          if (Math.abs(u) > 1) continue;
+          const grain = noise2(x / 7 + 40, y / 46, tr.seed + SEED), moss = noise2(x / 34, y / 60, tr.seed + 1 + SEED) > 0.58;
+          const lum = clamp((0.3 + 0.5 * Math.sqrt(1 - u * u)) * (1 + 0.35 * u * lit) * (0.7 + 0.6 * grain), 0, 1);
+          const jitter = Math.floor(hash(c, r, tr.seed) * 3) - 1;
+          if ((1 - Math.abs(u)) * rad < cw * 0.3) add(back, r * cols + c, 0, RAMP.charCodeAt(clamp(Math.floor(lum * RAMP.length) + jitter, 0, RAMP.length - 1)), this.bark(lum, 1, moss));
+          else if (grain < 0.34) add(back, r * cols + c, this.bark(lum * 0.8, 1, moss) || 1, 124, this.bark(lum, 0.35, moss));
+          else add(back, r * cols + c, this.bark(lum, 1, moss) || 1, RAMP.charCodeAt(clamp(Math.floor((1 - lum) * RAMP.length) + jitter, 0, RAMP.length - 1)), this.bark(lum, 0.5, moss));
+        }
+      }
+    }
+    // the canopy: a ragged dark fringe along the top, deeper in the corners
+    for (let c = 0; c < cols; c++) {
+      const x = (c + 0.5) * cw;
+      const depth = 2 + noise1(x / 90, SEED + 70) * 7 + 7 * Math.pow(Math.abs(x / W - 0.5) * 2, 3) + noise1(x / 23, SEED + 71) * 3;
+      for (let r = 0; r < depth && r < rows; r++) {
+        const y = (r + 0.5) * ch, e = depth - r;                   // rows left before the fringe ends
+        if (e < 3 && noise2(x / 12, y / 12, SEED + 72) < 0.42) continue;
+        const k = e < 1.5 ? 2.6 : e < 3 ? 1.6 : 0.8 + 0.5 * hash(c, r, 73);   // the lower edge catches some light
+        const col = tone(e < 1.5 ? LEAF : LEAF_DARK, e < 1.5 ? 0.55 : k);
+        if (e < 1 && hash(c, r, 74) < 0.5) add(front, r * cols + c, 0, "vV',"[(hash(c, r, 75) * 4) | 0].charCodeAt(0), tone(LEAF, 0.7));
+        else add(front, r * cols + c, col || 1, "%&#*v"[(hash(c, r, 75) * 5) | 0].charCodeAt(0), tone(LEAF, e < 1.5 ? 0.3 : 0.22 * k));
+      }
+    }
+    const pack4 = (st) => ({ idx: Int32Array.from(st.idx), fill: Uint32Array.from(st.fill), glyph: Uint16Array.from(st.glyph), colour: Uint32Array.from(st.colour) });
+    this.stampBack = pack4(back); this.stampFront = pack4(front);
+  },
+  stamp(st) {
+    for (let j = 0; j < st.idx.length; j++) {
+      const i = st.idx[j];
+      this.flag[i] = 1; this.fill[i] = st.fill[j]; this.glyph[i] = st.glyph[j]; this.colour[i] = st.colour[j];
+    }
+  },
+
+  cellIndex(x, y) {
+    const c = Math.floor(x / this.cw), r = Math.floor(y / this.ch);
+    return c < 0 || r < 0 || c >= this.cols || r >= this.rows ? -1 : r * this.cols + c;
+  },
+
+  // Wood colour for a brightness between 0 (underside) and 1 (lit top), greened over where moss grows.
+  bark(lum, k = 1, moss = false) {
+    let r = lerp(BARK_DARK[0], BARK_LIGHT[0], lum), g = lerp(BARK_DARK[1], BARK_LIGHT[1], lum), b = lerp(BARK_DARK[2], BARK_LIGHT[2], lum);
+    if (moss) { const m = 0.35 + 0.75 * lum; r = lerp(r, MOSS[0] * m, 0.65); g = lerp(g, MOSS[1] * m, 0.65); b = lerp(b, MOSS[2] * m, 0.65); }
+    return pack(r * k, g * k, b * k);
+  },
+
+  // Rasterize one bough: each segment is a tapered capsule. A cell inside it is
+  // placed in limb coordinates (how far along, how far off the centre line),
+  // which is what the shading, the bark grain and the moss are read from.
+  drawLimb(l) {
+    const { cw, ch, cols, rows } = this;
+    for (let k = 0; k < l.n; k++) {
+      const ax = l.x[k], ay = l.y[k], bx = l.x[k + 1], by = l.y[k + 1];
+      const ra = radius(l, k / l.n), rb = radius(l, (k + 1) / l.n);
+      if (ra < ch * 0.6) {
+        // too thin to reliably cover cell centres: walk the line instead
+        const steps = Math.max(1, Math.ceil(l.seg / (cw * 0.5))), solid = ra > cw * 0.4;
+        for (let j = 0; j <= steps; j++) {
+          const i = this.cellIndex(lerp(ax, bx, j / steps), lerp(ay, by, j / steps));
+          if (i < 0) continue;
+          this.flag[i] = 1;
+          this.glyph[i] = dirGlyph(l.a[k]);
+          this.fill[i] = solid ? this.bark(0.5) : 0;
+          this.colour[i] = solid ? this.bark(0.5, 0.45) : this.bark(0.75);
+        }
+        continue;
+      }
+      const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy || 1, len = Math.sqrt(len2);
+      const c0 = Math.max(0, Math.floor((Math.min(ax, bx) - ra) / cw)), c1 = Math.min(cols - 1, Math.floor((Math.max(ax, bx) + ra) / cw));
+      const r0 = Math.max(0, Math.floor((Math.min(ay, by) - ra) / ch)), r1 = Math.min(rows - 1, Math.floor((Math.max(ay, by) + ra) / ch));
+      for (let r = r0; r <= r1; r++) {
+        for (let c = c0; c <= c1; c++) {
+          const x = c * cw + cw / 2, y = r * ch + ch / 2;
+          const t = clamp(((x - ax) * dx + (y - ay) * dy) / len2, 0, 1);
+          const ex = x - (ax + dx * t), ey = y - (ay + dy * t);
+          const dist = Math.hypot(ex, ey), rad = lerp(ra, rb, t);
+          if (dist > rad) continue;
+          const i = r * cols + c;
+          const along = (k + t) * l.seg;                           // px from the limb's base
+          const off = (dx * (y - ay) - dy * (x - ax)) / len;       // px off the centre line
+          const round = 1 - 0.25 * (dist / rad) * (dist / rad);    // falls away toward the edges
+          const grain = noise2(along / 26, off / 4 + 50, l.seed);  // streaks running along the wood
+          const moss = ey < -0.2 * rad && noise2(along / 40, 3, l.seed + 2) > 0.42;   // on the upper side, in patches
+          const lum = clamp((0.62 - 0.38 * (ey / rad)) * round * (0.72 + 0.56 * grain), 0, 1);
+          const jitter = Math.floor(hash(Math.round(along / cw), Math.round(off / cw), l.seed) * 3) - 1;
+          this.flag[i] = 1;
+          if (rad - dist < cw * 0.3) {
+            // rim cell, only partly covered: a bare character, no block behind it
+            this.fill[i] = 0;
+            this.glyph[i] = RAMP.charCodeAt(clamp(Math.floor(lum * RAMP.length) + jitter, 0, RAMP.length - 1));
+            this.colour[i] = this.bark(lum, 1, moss);
+          } else if (grain < 0.36 && !moss) {
+            // a fissure in the bark: a dark stroke that follows the grain
+            this.fill[i] = this.bark(lum * 0.8) || 1;
+            this.glyph[i] = dirGlyph(l.a[k]);
+            this.colour[i] = this.bark(lum, 0.35);
+          } else {
+            this.fill[i] = this.bark(lum, 1, moss) || 1;
+            this.glyph[i] = RAMP.charCodeAt(clamp(Math.floor((1 - lum) * RAMP.length) + jitter, 0, RAMP.length - 1));
+            this.colour[i] = this.bark(lum, 0.5, moss);
+          }
+        }
+      }
+    }
+  },
+
+  // Leaves: a ragged disc of cells that rides on its joint of the bough. The
+  // pattern is fixed to the clump, so it moves in whole cells and never crawls.
+  drawClumps(g) {
+    const { cw, ch, cols, rows } = this;
+    for (const q of clumps) {
+      const l = q.l;
+      const cc = Math.floor((l.x[q.at] + q.ox + Math.sin(time * 1.1 + q.ph) * g * 4) / cw), rr = Math.floor((l.y[q.at] + q.oy) / ch);
+      const nx = Math.ceil(q.r / cw), ny = Math.ceil((q.r * 0.75) / ch);
+      for (let j = -ny; j <= ny; j++)
+        for (let i = -nx; i <= nx; i++) {
+          const d = Math.hypot(i * cw, (j * ch) / 0.75) / q.r, c = cc + i, r = rr + j;
+          if (d > 1 || c < 0 || r < 0 || c >= cols || r >= rows) continue;
+          if (hash(i, j, q.seed) < d * d * 0.8) continue;          // thinner toward the edge
+          const idx = r * cols + c;
+          const k = (0.6 + 0.5 * hash(i, j, q.seed + 1)) * (1 - 0.3 * (j / ny));   // lighter on top
+          this.flag[idx] = 1;
+          if (q.flower && hash(i, j, q.seed + 2) < 0.04) {
+            this.fill[idx] = tone(FLOWER, 0.9); this.glyph[idx] = 42; this.colour[idx] = pack(255, 226, 150);
+          } else if (d > 0.78) {
+            this.fill[idx] = 0; this.glyph[idx] = "vV^,"[(hash(i, j, q.seed + 3) * 4) | 0].charCodeAt(0); this.colour[idx] = tone(LEAF, k);
+          } else {
+            this.fill[idx] = tone(LEAF, k) || 1;
+            this.glyph[idx] = "%&vV*"[(hash(i, j, q.seed + 3) * 5) | 0].charCodeAt(0);
+            this.colour[idx] = tone(LEAF, k * 0.5);
+          }
+        }
+    }
+  },
+
+  // Fruit: each one is a single bright cell.
+  fruitCell(x, y) {
+    const i = this.cellIndex(x, y);
+    if (i < 0) return;
+    this.flag[i] = 1; this.fill[i] = pack(FRUIT[0], FRUIT[1], FRUIT[2]); this.glyph[i] = 111; this.colour[i] = pack(FRUIT_INK[0], FRUIT_INK[1], FRUIT_INK[2]);
+  },
+  drawFruit() {
+    for (const sp of fruits)
+      for (let j = 0; j < sp.n; j++) if (sp.back[j] <= time) { fruitPos(sp, j); this.fruitCell(FP.x, FP.y); }
+  },
+
+  // A vine: walk along the rope and mark every cell it crosses with the
+  // character that best matches its slope there.
+  drawVine(v) {
+    const { cw, ch } = this;
+    for (let k = 0; k < v.n; k++) {
+      const ax = v.x[k], ay = v.y[k], bx = v.x[k + 1], by = v.y[k + 1];
+      const ang = Math.atan2(by - ay, bx - ax), steps = Math.max(1, Math.ceil(v.seg / (cw * 0.5)));
+      const kk = 0.8 + 0.4 * hash(k, 0, v.seed);
+      for (let j = 0; j <= steps; j++) {
+        const i = this.cellIndex(lerp(ax, bx, j / steps), lerp(ay, by, j / steps));
+        if (i < 0) continue;
+        this.flag[i] = 1;
+        this.glyph[i] = dirGlyph(ang);
+        this.fill[i] = v.swing ? tone(VINE, kk) : 0;
+        this.colour[i] = v.swing ? tone(VINE, 0.4) : tone(VINE_THIN, kk);
+      }
+      if (v.swing || (k + v.seed) % 3) continue;
+      const i = this.cellIndex(ax + (k & 1 ? cw : -cw), ay + ch * 0.3);   // a leaf, on alternate sides
+      if (i < 0) continue;
+      this.flag[i] = 1;
+      this.fill[i] = tone(LEAF, kk * 0.85);
+      this.glyph[i] = k & 1 ? 62 : 60;
+      this.colour[i] = tone(LEAF, kk * 0.4);
+    }
+  },
+
+  // Rasterize a tapered capsule (or a disc, if both ends coincide) and hand
+  // every covered cell to `paint`, with its offset from the centre line.
+  capsule(ax, ay, bx, by, ra, rb, paint) {
+    const { cw, ch, cols, rows } = this;
+    const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy || 1;
+    const ang = Math.atan2(dy, dx), rm = Math.max(ra, rb);
+    if (rm < ch * 0.6) {
+      // too thin to reliably cover cell centres: walk the line instead
+      const steps = Math.max(1, Math.ceil(Math.sqrt(len2) / (cw * 0.5)));
+      for (let j = 0; j <= steps; j++) {
+        const i = this.cellIndex(ax + (dx * j) / steps, ay + (dy * j) / steps);
+        if (i >= 0) paint.call(this, i, 0, 0, 0, rm, ang, true);
+      }
+      return;
+    }
+    const c0 = Math.max(0, Math.floor((Math.min(ax, bx) - rm) / cw)), c1 = Math.min(cols - 1, Math.floor((Math.max(ax, bx) + rm) / cw));
+    const r0 = Math.max(0, Math.floor((Math.min(ay, by) - rm) / ch)), r1 = Math.min(rows - 1, Math.floor((Math.max(ay, by) + rm) / ch));
+    for (let r = r0; r <= r1; r++) {
+      for (let c = c0; c <= c1; c++) {
+        const x = c * cw + cw / 2, y = r * ch + ch / 2;
+        const t = clamp(((x - ax) * dx + (y - ay) * dy) / len2, 0, 1);
+        const ex = x - (ax + dx * t), ey = y - (ay + dy * t);
+        const dist = Math.hypot(ex, ey), rad = lerp(ra, rb, t);
+        if (dist <= rad) paint.call(this, r * cols + c, ex, ey, dist, rad, ang, false);
+      }
+    }
+  },
+
+  // Fur: lit from above, pale on the side that faces away from the back.
+  pCol: FURS[0], pBelly: false, pDim: 1, pBx: 0, pBy: -1,
+  paintFur(i, ex, ey, dist, rad, ang, thin) {
+    const col = !thin && this.pBelly && ex * this.pBx + ey * this.pBy < -0.45 * rad ? BELLY : this.pCol;
+    const lum = thin ? 0.75 : clamp((0.72 - 0.28 * (ey / rad)) * (1 - 0.2 * (dist / rad) * (dist / rad)), 0, 1);
+    const k = this.pDim * (0.5 + 0.5 * lum);
+    const tn = pack(col[0] * k, col[1] * k, col[2] * k);
+    this.flag[i] = 1;
+    if (!thin && rad - dist < this.cw * 0.3) {
+      this.fill[i] = 0;                                            // rim: bare character
+      this.glyph[i] = RAMP.charCodeAt(clamp(Math.floor(lum * RAMP.length), 0, RAMP.length - 1));
+      this.colour[i] = tn;
+    } else {
+      this.fill[i] = tn || 1;
+      this.glyph[i] = thin ? dirGlyph(ang) : RAMP.charCodeAt(clamp(Math.floor((1 - lum) * RAMP.length) + ((hash(i, 0, 3) * 3) | 0) - 1, 0, RAMP.length - 1));
+      this.colour[i] = pack(col[0] * k * 0.5, col[1] * k * 0.5, col[2] * k * 0.5);
+    }
+  },
+
+  drawMonkey(m) {
+    if (!m.on) return;
+    const Z = m.S, p = m.pts, fur = this.paintFur;
+    const limb = (g, r0, r1, r2) => {
+      this.capsule(g[0], g[1], g[2], g[3], r0 * Z, r1 * Z, fur);
+      this.capsule(g[2], g[3], g[4], g[5], r1 * Z, r2 * Z, fur);
+    };
+    this.pBx = m.bkx; this.pBy = m.bky;
+
+    // far arm and leg, in shadow
+    this.pCol = m.fur; this.pBelly = false; this.pDim = 0.55;
+    limb(m.legs[1], 0.085, 0.06, 0.045); limb(m.arms[1], 0.07, 0.055, 0.045);
+
+    this.pDim = 0.8;
+    for (let k = 0; k < NT; k++) this.capsule(m.tx[k], m.ty[k], m.tx[k + 1], m.ty[k + 1], 0.045 * Z, 0.04 * Z, fur);
+
+    // body, head, muzzle, ear
+    this.pDim = 1; this.pBelly = true;
+    this.capsule(p[0], p[1], p[2], p[3], 0.15 * Z, 0.155 * Z, fur);
+    this.pBelly = false;
+    const hl = Math.hypot(m.hfx, m.hfy) || 1, fx = m.hfx / hl, fy = m.hfy / hl;
+    let ux = fy, uy = -fx;                                         // up, as the head sees it
+    if (uy > 0) { ux = -ux; uy = -uy; }
+    this.capsule(p[2], p[3], p[4], p[5], 0.12 * Z, 0.12 * Z, fur);   // neck
+    this.capsule(p[4], p[5], p[4], p[5], 0.145 * Z, 0.145 * Z, fur);
+    this.pCol = FACE;
+    this.capsule(p[4] + (fx * 0.05 - ux * 0.02) * Z, p[5] + (fy * 0.05 - uy * 0.02) * Z, p[4] + (fx * 0.13 - ux * 0.04) * Z, p[5] + (fy * 0.13 - uy * 0.04) * Z, 0.095 * Z, 0.065 * Z, fur);
+    this.capsule(p[4] - (fx * 0.1 - ux * 0.02) * Z, p[5] - (fy * 0.1 - uy * 0.02) * Z, p[4] - (fx * 0.1 - ux * 0.02) * Z, p[5] - (fy * 0.1 - uy * 0.02) * Z, 0.045 * Z, 0.045 * Z, fur);
+
+    // near leg and arm
+    this.pCol = m.fur; this.pDim = 0.92;
+    limb(m.legs[0], 0.085, 0.06, 0.045); limb(m.arms[0], 0.07, 0.055, 0.045);
+
+    const i = this.cellIndex(p[4] + (fx * 0.045 + ux * 0.045) * Z, p[5] + (fy * 0.045 + uy * 0.045) * Z);
+    if (i >= 0) {
+      this.flag[i] = 1;
+      this.fill[i] = tone(FACE, 0.9);
+      this.glyph[i] = 0x25cf;                                      // ●
+      this.colour[i] = pack(EYE[0], EYE[1], EYE[2]);
+    }
+    if (m.fruit) this.fruitCell(p[8], p[9]);                       // in its far hand
+  },
+
+  // Rasterize the snake: for every grid cell near a stretch of its spine, find
+  // where that cell sits in body coordinates (how far from the nose, how far
+  // off the centre line) and read the markings from that, so they travel with
+  // the body. Stretches round the back of the tree are skipped.
+  drawSnake() {
+    const s = snake;
+    if (!s.on) return;
+    const { cw, ch, cols, rows } = this, bw = s.L * 0.019;
+    for (let k = SK - 2; k >= 0; k--) {                            // tail first, head on top
+      if (s.z[k] + s.z[k + 1] < 0) continue;
+      const ax = s.x[k], ay = s.y[k], bx = s.x[k + 1], by = s.y[k + 1];
+      const ra = bw * snakeW(k / (SK - 1)), rb = bw * snakeW((k + 1) / (SK - 1)), rm = Math.max(ra, rb);
+      const dim = 0.5 + 0.5 * clamp((s.z[k] + s.z[k + 1]) * 0.5, 0, 1);   // darker as it rounds the trunk
+      const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy || 1, len = Math.sqrt(len2);
+      if (rm < ch * 0.55) {
+        const steps = Math.max(1, Math.ceil(len / (cw * 0.5)));
+        for (let j = 0; j <= steps; j++) {
+          const i = this.cellIndex(ax + (dx * j) / steps, ay + (dy * j) / steps);
+          if (i < 0) continue;
+          this.flag[i] = 1; this.fill[i] = tone(SN_BODY, 0.8 * dim); this.glyph[i] = dirGlyph(Math.atan2(dy, dx)); this.colour[i] = tone(SN_BODY, 0.4 * dim);
+        }
+        continue;
+      }
+      const c0 = Math.max(0, Math.floor((Math.min(ax, bx) - rm) / cw)), c1 = Math.min(cols - 1, Math.floor((Math.max(ax, bx) + rm) / cw));
+      const r0 = Math.max(0, Math.floor((Math.min(ay, by) - rm) / ch)), r1 = Math.min(rows - 1, Math.floor((Math.max(ay, by) + rm) / ch));
+      for (let r = r0; r <= r1; r++) {
+        for (let c = c0; c <= c1; c++) {
+          const x = c * cw + cw / 2, y = r * ch + ch / 2;
+          const t = clamp(((x - ax) * dx + (y - ay) * dy) / len2, 0, 1);
+          const ex = x - (ax + dx * t), ey = y - (ay + dy * t);
+          const dist = Math.hypot(ex, ey), rad = lerp(ra, rb, t);
+          if (dist > rad) continue;
+          const arc = ((k + t) / (SK - 1)) * s.L, off = (dx * (y - ay) - dy * (x - ax)) / len;
+          // pale diamonds along the back, a yellow belly underneath
+          const cell = arc / (bw * 3.4), fr = cell - Math.floor(cell);
+          let col = k > 1 && Math.abs(fr - 0.5) < 0.15 * (1 - (Math.abs(off) / rad) * 0.8) ? SN_MARK : SN_BODY;
+          if (ey > rad * 0.45) col = SN_BELLY;
+          const lum = clamp((0.72 - 0.3 * (ey / rad)) * (1 - 0.2 * (dist / rad) * (dist / rad)), 0, 1);
+          const kk = dim * (0.5 + 0.5 * lum), tn = tone(col, kk), i = r * cols + c;
+          const jitter = Math.floor(hash(Math.round(arc / cw), Math.round(off / cw), 9) * 3) - 1;
+          this.flag[i] = 1;
+          if (rad - dist < cw * 0.3) {
+            this.fill[i] = 0;
+            this.glyph[i] = RAMP.charCodeAt(clamp(Math.floor(lum * RAMP.length) + jitter, 0, RAMP.length - 1));
+            this.colour[i] = tn;
+          } else {
+            this.fill[i] = tn || 1;
+            this.glyph[i] = RAMP.charCodeAt(clamp(Math.floor((1 - lum) * RAMP.length) + jitter, 0, RAMP.length - 1));
+            this.colour[i] = tone(col, kk * 0.45);
+          }
+        }
+      }
+    }
+    if (s.hz <= 0) return;
+    let hx = s.x[0] - s.x[2], hy = s.y[0] - s.y[2];
+    const hl = Math.hypot(hx, hy) || 1;
+    hx /= hl; hy /= hl;
+    let ux = hy, uy = -hx;
+    if (uy > 0) { ux = -ux; uy = -uy; }
+    const i = this.cellIndex(s.x[0] - hx * bw * 0.2 + ux * bw * 0.45, s.y[0] - hy * bw * 0.2 + uy * bw * 0.45);
+    if (i >= 0) { this.flag[i] = 1; this.fill[i] = tone(SN_BODY, 0.95); this.glyph[i] = s.state === "fall" ? 120 : 0x25cf; this.colour[i] = pack(EYE[0], EYE[1], EYE[2]); }
+    if (s.tongue > 0)
+      for (let j = 1; j <= 2; j++) {
+        const t = this.cellIndex(s.x[0] + hx * (bw * 1.3 + cw * j), s.y[0] + hy * (bw * 1.3 + cw * j));
+        if (t < 0 || this.flag[t]) continue;
+        this.flag[t] = 1; this.fill[t] = 0; this.glyph[t] = j === 2 ? (hx > 0 ? 60 : 62) : dirGlyph(Math.atan2(hy, hx)); this.colour[t] = pack(TONGUE[0], TONGUE[1], TONGUE[2]);
+      }
+  },
+
+  // Ferns in front of the floor: each frond is a chain of short segments that
+  // arches over under its own weight and ripples from root to tip in the wind.
+  drawFerns(g) {
+    const { cw } = this, N = 9;
+    for (const f of ferns)
+      for (const fr of f.fronds) {
+        let x = f.x, y = f.y;
+        const seg = fr.len / N, steps = Math.max(1, Math.ceil(seg / (cw * 0.5))), out = Math.cos(fr.ang) >= 0 ? 1 : -1;
+        for (let k = 0; k < N; k++) {
+          const t = (k + 1) / N;
+          const a = fr.ang + out * 0.9 * t * t + 0.22 * g * Math.sin(time * 1.2 + fr.ph - t * 2.5) * t;
+          const nx = x + Math.cos(a) * seg, ny = y + Math.sin(a) * seg, kk = f.shade * (0.55 + 0.6 * t);
+          for (let j = 1; j <= steps; j++) {
+            const i = this.cellIndex(lerp(x, nx, j / steps), lerp(y, ny, j / steps));
+            if (i < 0) continue;
+            this.flag[i] = 1;
+            this.fill[i] = k < 4 ? tone(FERN, kk * 0.6) : 0;
+            this.glyph[i] = dirGlyph(a);
+            this.colour[i] = k < 4 ? tone(FERN, kk * 1.3) : tone(FERN, kk);
+          }
+          x = nx; y = ny;
+        }
+      }
+  },
+
+  // Pollen and insects drifting in the light. Far ones are dim dots that
+  // anything can cover; near ones, and falling leaves, are drawn over the top.
+  drawAir(front) {
+    for (const f of motes) {
+      if (f.z >= 0.7 !== front) continue;
+      const i = this.cellIndex(f.x, f.y);
+      if (i < 0 || this.flag[i]) continue;
+      const k = (front ? 0.75 : 0.25 + 0.5 * f.z) * (0.7 + 0.3 * Math.sin(time * 2 + f.ph * 5));
+      this.flag[i] = 1; this.fill[i] = 0;
+      this.glyph[i] = f.z < 0.35 ? 46 : 0xb7;                      // . and ·
+      this.colour[i] = pack(lerp(BG[0], MOTE[0], k), lerp(BG[1], MOTE[1], k), lerp(BG[2], MOTE[2], k));
+    }
+    if (!front) return;
+    for (const b of bits) {
+      const i = this.cellIndex(b.x, b.y);
+      if (i < 0) continue;
+      if (!this.flag[i]) { this.flag[i] = 1; this.fill[i] = 0; }
+      this.glyph[i] = "\\-/|".charCodeAt(Math.floor(time * 5 + b.ph) & 3);   // tumbling
+      this.colour[i] = b.fruit ? pack(FRUIT[0], FRUIT[1], FRUIT[2]) : pack(176, 206, 84);
+    }
+    for (const q of shots) this.fruitCell(q.x, q.y);
+  },
+
+  render() {
+    const { ctx, dpr, cols, cw, ch } = this;
+    const g = gust();
+    this.flag.fill(0);
+    this.drawAir(false);
+    for (const v of vines) if (!v.swing) this.drawVine(v);         // creepers, behind everything
+    for (const l of limbs) this.drawLimb(l);
+    this.drawClumps(g);
+    this.drawFruit();
+    for (const v of vines) if (v.swing) this.drawVine(v);
+    for (const m of monkeys) this.drawMonkey(m);
+    this.stamp(this.stampBack);                                    // the trunks stand in front of the boughs
+    this.drawFerns(g);
+    this.drawSnake();
+    this.stamp(this.stampFront);                                   // the canopy hides where the vines are tied
+    this.drawAir(true);
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(this.bg, 0, 0);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // one character per occupied cell
+    ctx.font = `600 ${Math.round(ch * 0.78)}px ${this.font}`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    let lastStyle = "";
+    for (let i = 0; i < this.flag.length; i++) {
+      if (!this.flag[i]) continue;
+      const x = (i % cols) * cw, y = ((i / cols) | 0) * ch;
+      if (this.fill[i]) {
+        const fs = css(this.fill[i]);
+        if (fs !== lastStyle) ctx.fillStyle = lastStyle = fs;
+        ctx.fillRect(x + 1, y + 1, cw - 1, ch - 1);
+      }
+      const gs = css(this.colour[i]);
+      if (gs !== lastStyle) ctx.fillStyle = lastStyle = gs;
+      ctx.fillText(String.fromCharCode(this.glyph[i]), x + cw / 2, y + ch / 2 + ch * 0.06);
+    }
+  },
+};
+
+// ---------- boot ----------
+const canvas = document.querySelector("canvas");
+renderer.canvas = canvas;
+renderer.ctx = canvas.getContext("2d", { alpha: false });
+renderer.bg = document.createElement("canvas");
+renderer.font = getComputedStyle(canvas).fontFamily || "monospace";
+
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  if (w < 1 || h < 1) return;
+  W = w; H = h;
+  renderer.resize(w, h, Math.min(window.devicePixelRatio || 1, 2));
+  build();
+  renderer.cache();
+  renderer.render();
+}
+
+// Frames drawn per second; override with ?fps=20 etc.
+const FPS = clamp(Number(params.get("fps")) || 30, 5, 120);
+const still = window.matchMedia("(prefers-reduced-motion: reduce)");
+let last = 0;
+
+function tick(dt) {
+  time += dt;
+  pose(dt);
+  stepVines(dt);
+  for (const m of monkeys) stepMonkey(m, dt);
+  stepSnake(dt);
+  stepAir(dt);
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 1000 / FPS - 2) return;                         // not time for the next frame yet
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  tick(dt);
+  renderer.render();
+}
+
+window.addEventListener("resize", resize);
+resize();
+// ?t=20 starts the scene 20 seconds in
+for (let i = 0, n = Math.round((Number(params.get("t")) || 0) * 30); i < n; i++) tick(1 / 30);
+renderer.render();
+if (!still.matches) {
+  last = performance.now();
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>

@@ -23,6 +23,7 @@
   <a href="branch.html">Winter branch</a>
   <a href="station.html">Orbital station</a>
   <a href="depot.html">Freight depot</a>
+  <a href="jungle.html">Jungle</a>
 </nav>
 <script>
 "use strict";
@@ -109,11 +110,11 @@ const FONT = {
   C: ["111", "100", "100", "100", "111"], D: ["110", "101", "101", "101", "110"],
   E: ["111", "100", "110", "100", "111"], F: ["111", "100", "110", "100", "100"],
   G: ["111", "100", "101", "101", "111"], H: ["101", "101", "111", "101", "101"],
-  I: ["111", "010", "010", "010", "111"], K: ["101", "101", "110", "101", "101"],
+  I: ["111", "010", "010", "010", "111"], J: ["001", "001", "001", "101", "111"], K: ["101", "101", "110", "101", "101"],
   L: ["100", "100", "100", "100", "111"], N: ["1001", "1101", "1011", "1001", "1001"],
   O: ["111", "101", "101", "101", "111"], P: ["111", "101", "111", "100", "100"],
   R: ["110", "101", "110", "101", "101"], S: ["111", "100", "111", "001", "111"],
-  T: ["111", "010", "010", "010", "010"], W: ["10001", "10001", "10101", "10101", "01010"],
+  T: ["111", "010", "010", "010", "010"], U: ["101", "101", "101", "101", "111"], W: ["10001", "10001", "10101", "10101", "01010"],
   " ": ["00", "00", "00", "00", "00"],
 };
 function textWidth(str, sx) {
@@ -133,7 +134,7 @@ function text(str, x, y, sx, sy, r, g, b) {
   }
 }
 
-// ---------- the four little scenes ----------
+// ---------- the little scenes ----------
 const FISH = [
   { c: [240, 122, 40], p: [246, 240, 228], ph: 0 },
   { c: [244, 240, 230], p: [214, 60, 44], ph: 9.3 },
@@ -325,11 +326,42 @@ function depot(t) {
   }
 }
 
+function jungle(t) {
+  const { w, h } = K;
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const n = noise2(x * 0.09, y * 0.2, 61);
+      if (y < h * (0.1 + 0.16 * noise1(x * 0.12, 62))) { const k = 0.7 + 0.6 * hash(x, y, 63); blk(x, y, 14 * k, 50 * k, 26 * k); }
+      else if (n > 0.6) { const k = (n - 0.6) * 2.5; put(x, y, 37, 16 + 30 * k, 50 + 80 * k, 36 + 40 * k); }
+    }
+  for (let x = 0; x < w; x++) { const k = 0.8 + 0.4 * hash(x, 0, 64); blk(x, h - 1, 30 * k, 44 * k, 22 * k); }
+  // a bough, with a tuft of leaves at its tip
+  const by = Math.round(h * 0.42), bx = Math.round(w * 0.42);
+  for (let x = 0; x < bx; x++) { const k = 0.8 + 0.3 * hash(x, 1, 64); blk(x, by - Math.round(x * 0.06), 110 * k, 84 * k, 56 * k); }
+  disc(bx, by - bx * 0.06 - 1, h * 0.09, (u, v, x, y) => { const k = 0.7 + 0.5 * hash(x, y, 65); return [40 * k, 130 * k, 50 * k]; });
+  // a monkey on a vine
+  const ax = w * 0.66, L = h * 0.62, th = 0.62 * Math.sin(t * 1.7), sx = Math.sin(th) * 1.5, cy = Math.cos(th);
+  for (let j = 0; j < L + h * 0.2; j++) put(ax + sx * j, cy * j, th > 0.2 ? 92 : th < -0.2 ? 47 : 124, 120, 150, 60);
+  const r = h * 0.085, lag = 0.62 * Math.sin(t * 1.7 - 0.5), mx = ax + sx * L, my = cy * L;
+  const bxm = mx + Math.sin(lag) * 1.5 * r * 1.6, bym = my + Math.cos(lag) * r * 1.6;
+  for (let j = 1; j <= 4; j++) blk(bxm - Math.sign(Math.cos(t * 1.7) || 1) * (r + j * 0.8), bym + r * 0.5 + j * 0.5, 150, 92, 44);
+  for (let j = 0; j <= 3; j++) blk(lerp(mx, bxm, j / 3), lerp(my, bym, j / 3), 176, 110, 56);
+  disc(bxm, bym, r, () => [186, 116, 56]);
+  disc(bxm + Math.cos(t * 1.7) * r * 0.5, bym - r * 0.95, r * 0.7, (u, v) => (v > 0.1 ? [232, 196, 160] : [186, 116, 56]));
+  // a snake along the floor
+  const hx = ((t * 3) % (w + 34)) - 4;
+  for (let i = 0; i < 24; i++) {
+    const x = hx - i, c = i % 5 === 2 ? [240, 234, 140] : [116, 196, 60];
+    blk(x, h - 2 + Math.round(Math.sin(x * 0.45) * 0.6), c[0], c[1], c[2]);
+  }
+}
+
 const SCENES = [
   { name: "KOI", acc: [240, 132, 52], draw: koi },
   { name: "BRANCH", acc: [230, 92, 68], draw: branch },
   { name: "STATION", acc: [232, 190, 110], draw: station },
   { name: "DEPOT", acc: [110, 200, 240], draw: depot },
+  { name: "JUNGLE", acc: [124, 204, 62], draw: jungle },
 ];
 const TITLE = "ASCII SCENES";
 const links = [...document.querySelectorAll("nav a")];
@@ -341,18 +373,22 @@ function plan() {
   for (const s of [[3, 2], [2, 1], [1, 1]]) if (textWidth(TITLE, s[0]) <= cols - 8) { ts = s; break; }
   const titleH = 5 * ts[1], top = 3 + titleH + 3;
   let best = null;
-  for (const n of [4, 2, 1]) {
-    const lines = 4 / n, cardW = Math.floor((cols - 8 - (n - 1) * 4) / n);
+  const N = SCENES.length;
+  for (const n of [N, 3, 2, 1]) {
+    const lines = Math.ceil(N / n), cardW = Math.floor((cols - 8 - (n - 1) * 4) / n);
     const per = Math.floor((rows - top - 1) / lines);
     const h = Math.min(per - 11, Math.round((cardW - 2) / 3), 46);
     if (!best || h > best.h) best = { n, h, per };
   }
-  const { n, per } = best, h = Math.max(6, best.h), w = h * 3, lines = 4 / n;
+  const { n, per } = best, h = Math.max(6, best.h), w = h * 3, lines = Math.ceil(N / n);
   const gap = n > 1 ? Math.min(8, Math.floor((cols - 4 - n * (w + 2)) / (n - 1))) : 0;
   const gx = Math.floor((cols - n * (w + 2) - (n - 1) * gap) / 2) + 1;
   const block = h + 11, gy = top + Math.max(0, Math.floor((rows - top - lines * block) / 2)) + 1;
   const ls = textWidth("STATION", 2) <= w ? 2 : 1;
-  const cards = SCENES.map((_, i) => ({ x: gx + (i % n) * (w + 2 + gap), y: gy + Math.floor(i / n) * block, w, h }));
+  const cards = SCENES.map((_, i) => {
+    const row = Math.floor(i / n), short = n - Math.min(n, N - row * n);          // a last row that is not full is centred
+    return { x: gx + Math.floor((short * (w + 2 + gap)) / 2) + (i % n) * (w + 2 + gap), y: gy + row * block, w, h };
+  });
   layout = { ts, titleY: Math.max(1, gy - 4 - titleH), cards, ls };
   cards.forEach((c, i) => {
     const st = links[i].style;
