@@ -1,0 +1,937 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ascii orbital station</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060e; overflow: hidden; }
+  canvas {
+    display: block; width: 100vw; height: 100vh;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+</style>
+</head>
+<body>
+<canvas aria-hidden="true"></canvas>
+<script>
+"use strict";
+
+// ---------- small helpers ----------
+const TAU = Math.PI * 2;
+const DEG = Math.PI / 180;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (t) => t * t * (3 - 2 * t);
+
+function hash(x, y, s) {
+  let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(s | 0, 1274126177)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function noise1(x, s) {
+  const xi = Math.floor(x), u = smooth(x - xi);
+  return lerp(hash(xi, 0, s), hash(xi + 1, 0, s), u);
+}
+// 2D noise that repeats every `per` units of x, so it can wrap around a planet
+function pnoise(x, y, per, s) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const u = smooth(x - xi), v = smooth(y - yi);
+  const x0 = ((xi % per) + per) % per, x1 = (x0 + 1) % per;
+  return lerp(
+    lerp(hash(x0, yi, s), hash(x1, yi, s), u),
+    lerp(hash(x0, yi + 1, s), hash(x1, yi + 1, s), u),
+    v
+  );
+}
+function angleDiff(a, b) {
+  let d = (a - b) % TAU;
+  if (d > Math.PI) d -= TAU;
+  if (d < -Math.PI) d += TAU;
+  return d;
+}
+function mulberry(a) {
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const pack = (r, g, b) => (clamp(r | 0, 0, 255) << 16) | (clamp(g | 0, 0, 255) << 8) | clamp(b | 0, 0, 255);
+const cssCache = new Map();
+function css(c) {
+  c &= 0xf8f8f8;
+  let v = cssCache.get(c);
+  if (v === undefined) cssCache.set(c, (v = `rgb(${c >>> 16},${(c >>> 8) & 255},${c & 255})`));
+  return v;
+}
+// A line drawn at this angle looks most like which character?
+function dirGlyph(a) {
+  a = ((a % Math.PI) + Math.PI) % Math.PI;
+  if (a < Math.PI / 8 || a >= (7 * Math.PI) / 8) return 45;   // -
+  if (a < (3 * Math.PI) / 8) return 92;                        // \
+  if (a < (5 * Math.PI) / 8) return 124;                       // |
+  return 47;                                                   // /
+}
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+
+// ---------- look ----------
+const params = new URLSearchParams(location.search);
+const SEED = Number(params.get("seed")) || 1 + ((Math.random() * 1e6) | 0);   // ?seed=123 to keep a planet
+const ORBIT = clamp(Number(params.get("orbit")) || 480, 30, 36000);           // seconds for one lap around the planet
+const BG = [5, 6, 14];
+const NIGHT = [30, 20, 34];               // the planet's unlit side
+const ATMOS = [255, 232, 196];            // haze along the sunlit limb
+const STORM = [168, 62, 40];
+const BANDS = [                           // cloud belts are picked from these
+  [236, 214, 176], [206, 168, 118], [178, 128, 78], [150, 92, 60],
+  [242, 228, 200], [126, 82, 62], [216, 184, 136], [192, 150, 104],
+];
+const POLE = [112, 124, 152];
+const RINGS = [                           // inner edge, outer edge (planet radii), opacity, colour
+  [1.24, 1.40, 0.24, [132, 120, 116]],
+  [1.44, 1.63, 0.52, [176, 160, 140]],
+  [1.66, 2.02, 0.96, [236, 222, 194]],
+  [2.10, 2.36, 0.76, [206, 190, 164]],
+  [2.46, 2.52, 0.72, [176, 204, 236]],
+  [2.72, 2.94, 0.30, [118, 148, 196]],
+];
+const MOONS = [                           // orbit radius, size (planet radii), where it starts, colour
+  { r: 2.62, size: 0.030, th: 0.6, col: [200, 196, 190] },
+  { r: 3.25, size: 0.058, th: 3.9, col: [214, 190, 158] },
+  { r: 4.10, size: 0.044, th: 4.6, col: [176, 198, 222] },
+];
+const HULL = [208, 214, 226];
+const TRIM = [104, 112, 132];
+const PANEL = [34, 78, 168];
+const PANEL_LINE = [112, 156, 226];
+const PANEL_BACK = [78, 80, 94];
+const WINDOW = [255, 216, 124];
+const WINDOW_OFF = [44, 52, 72];
+const FOIL = [216, 162, 62];
+const ACCENT = [226, 92, 48];
+const DISH = [232, 234, 240];
+
+// ---------- the planet's frame ----------
+// Camera axes: x right, y down, z toward the viewer. The camera rides along
+// with the station, always looking at the planet, so the sun and the stars
+// wheel slowly around the scene once per orbit.
+const OPEN = 22 * DEG;                    // how far the rings are tipped open toward us
+const ROLL = 14 * DEG;                    // and how far the whole system leans on screen
+const P = [Math.cos(OPEN) * Math.sin(ROLL), -Math.cos(OPEN) * Math.cos(ROLL), Math.sin(OPEN)];   // the pole
+const E1 = [Math.cos(ROLL), Math.sin(ROLL), 0];                                                  // two axes in the ring plane
+const E2 = cross(P, E1);
+const CAM_RATE = TAU / ORBIT;             // our own orbital rate; everything below is relative to it
+const OMEGA0 = 0.095;                     // orbital rate at one planet radius; falls off as r^-1.5
+const SPIN = 0.03;                        // how fast the cloud tops turn past us
+const SUN_EL = 14 * DEG;                  // the sun sits this far above the ring plane
+const PHASE0 = 60 * DEG;
+const RMIN = 1.2, RMAX = 3.0, RN = 900, RK = RN / (RMAX - RMIN);
+const NB = 13, NX = 28;
+
+let W = 0, H = 0, time = 0;
+const G = { cx: 0, cy: 0, Rp: 1, sx: 0, sy: 0, S: 1 };
+const sun = [0, 0, 1];
+let sunVis = 1;                           // 0 while the station is in the planet's shadow
+
+function stepSun() {
+  const a = PHASE0 - CAM_RATE * time, ce = Math.cos(SUN_EL), se = Math.sin(SUN_EL);
+  for (let k = 0; k < 3; k++) sun[k] = ce * (Math.cos(a) * E1[k] + Math.sin(a) * E2[k]) + se * P[k];
+  sunVis = smooth(clamp((sun[2] + 0.72) / 0.16, 0, 1));
+}
+
+// ring profile: opacity and colour against radius
+const ringOp = new Float32Array(RN), ringR = new Float32Array(RN), ringG = new Float32Array(RN), ringB = new Float32Array(RN);
+// cloud belts: colour against latitude, and how fast each belt drifts
+const BT = new Uint8Array(256 * 3);
+const bandSpeed = new Float32Array(NB);
+const STORM_SL = 0.12;
+let stormBand = 0, storm0 = 0;
+
+function buildPlanet() {
+  const rnd = mulberry(SEED);
+  for (let i = 0; i < RN; i++) {
+    const r = RMIN + (i + 0.5) / RK;
+    ringOp[i] = 0;
+    RINGS.forEach((g, k) => {
+      if (r <= g[0] || r >= g[1]) return;
+      const edge = clamp(Math.min(r - g[0], g[1] - r) / 0.012, 0, 1);
+      let fine = 0.7 + 0.3 * noise1(r * 55, SEED + k);
+      if (noise1(r * 23, SEED + 40 + k) < 0.16) fine *= 0.6;         // thin gaps inside a ring
+      ringOp[i] = g[2] * edge * fine;
+      const tone = 0.86 + 0.14 * noise1(r * 31, SEED + 80 + k);
+      ringR[i] = g[3][0] * tone; ringG[i] = g[3][1] * tone; ringB[i] = g[3][2] * tone;
+    });
+  }
+  const cols = [];
+  let last = -1;
+  for (let j = 0; j <= NB; j++) {
+    let c;
+    do c = (rnd() * BANDS.length) | 0; while (c === last);
+    last = c;
+    cols.push(j === 0 || j === NB ? POLE : j === 1 || j === NB - 1 ? [150, 142, 150] : BANDS[c]);
+  }
+  for (let i = 0; i < 256; i++) {
+    const f = (i / 255) * NB + 0.5, c = Math.min(NB, f | 0), g = f - c;
+    let a = cols[c], b = a, t = 0;
+    if (g < 0.16 && c > 0) { b = cols[c - 1]; t = 0.5 - 0.5 * (g / 0.16); }
+    else if (g > 0.84 && c < NB) { b = cols[c + 1]; t = 0.5 * ((g - 0.84) / 0.16); }
+    for (let k = 0; k < 3; k++) BT[i * 3 + k] = lerp(a[k], b[k], t);
+  }
+  for (let j = 0; j < NB; j++) bandSpeed[j] = SPIN * (0.75 + 0.5 * rnd());
+  stormBand = Math.min(NB - 1, ((STORM_SL * 0.5 + 0.5) * NB) | 0);
+  storm0 = rnd() * TAU;
+}
+
+// ---------- stars ----------
+const stars = [];
+function buildStars() {
+  const rnd = mulberry(SEED + 5);
+  stars.length = 0;
+  for (let i = 0, n = Math.round((W * H) / 2300); i < n; i++)
+    stars.push({ x: rnd() * W, y: rnd() * H, b: 0.22 + 0.78 * Math.pow(rnd(), 2.6), ph: rnd() * TAU, f: 0.6 + 2.4 * rnd(), tint: rnd() });
+}
+function stepStars(dt) {
+  const v = (W / ORBIT) * 2.2;                                    // the far sky slides by as we go around
+  for (const s of stars) {
+    s.x -= E1[0] * v * dt; s.y -= E1[1] * v * dt;
+    if (s.x < 0) s.x += W; else if (s.x >= W) s.x -= W;
+    if (s.y < 0) s.y += H; else if (s.y >= H) s.y -= H;
+  }
+}
+
+// ---------- the station ----------
+// A real 3D model: every frame its surfaces are sampled point by point, turned
+// and lit, and dropped into a depth buffer six times finer than the cell grid.
+// Cells the model mostly covers become blocks; the fringe becomes bare glyphs.
+const MS = new Float64Array(9);           // the station's attitude
+const F = new Float64Array(9), T = new Float64Array(3);   // frame the samplers are currently writing in
+let SZ = new Float32Array(0), SCOL = new Uint32Array(0), SGL = new Uint16Array(0), SPR = new Uint8Array(0);
+let SW = 0, SH = 0, IQX = 1, IQY = 1, OX = 0, OY = 0, stp = 0.01;
+let mr = 0, mg = 0, mb = 0, mprio = 1, memit = false;
+let shineK = 0;
+const SHINE = [0, 0, -1];                 // direction the planet's glow comes from
+const AMB = 0.12;
+const st = { wheel: 0, panel: 0.4, dishA: 0 };
+
+function mat(c, prio, emit, k) {
+  const m = k === undefined ? 1 : k;
+  mr = c[0] * m; mg = c[1] * m; mb = c[2] * m; mprio = prio === undefined ? 1 : prio; memit = !!emit;
+}
+function rot3(out, yaw, pitch, roll) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch), cr = Math.cos(roll), sr = Math.sin(roll);
+  // Rz(roll) * Ry(yaw) * Rx(pitch)
+  const a0 = cy, a1 = sy * sp, a2 = sy * cp, b1 = cp, b2 = -sp, c0 = -sy, c1 = cy * sp, c2 = cy * cp;
+  out[0] = cr * a0; out[1] = cr * a1 - sr * b1; out[2] = cr * a2 - sr * b2;
+  out[3] = sr * a0; out[4] = sr * a1 + cr * b1; out[5] = sr * a2 + cr * b2;
+  out[6] = c0; out[7] = c1; out[8] = c2;
+}
+function useStation() { F.set(MS); T[0] = T[1] = T[2] = 0; }
+// a frame of its own, given in station coordinates: three axes and an origin
+function useLocal(xa, ya, za, o) {
+  for (let r = 0; r < 3; r++) {
+    const m0 = MS[r * 3], m1 = MS[r * 3 + 1], m2 = MS[r * 3 + 2];
+    F[r * 3] = m0 * xa[0] + m1 * xa[1] + m2 * xa[2];
+    F[r * 3 + 1] = m0 * ya[0] + m1 * ya[1] + m2 * ya[2];
+    F[r * 3 + 2] = m0 * za[0] + m1 * za[1] + m2 * za[2];
+    T[r] = m0 * o[0] + m1 * o[1] + m2 * o[2];
+  }
+}
+
+function emit(x, y, z, nx, ny, nz, gl) {
+  const NZ = F[6] * nx + F[7] * ny + F[8] * nz;
+  if (NZ < -0.02) return;
+  const px = (OX + (F[0] * x + F[1] * y + F[2] * z + T[0]) * G.S) * IQX;
+  const py = (OY + (F[3] * x + F[4] * y + F[5] * z + T[1]) * G.S) * IQY;
+  if (px < 0 || py < 0 || px >= SW || py >= SH) return;
+  const k = (py | 0) * SW + (px | 0);
+  const Z = F[6] * x + F[7] * y + F[8] * z + T[2];
+  if (Z <= SZ[k]) return;
+  SZ[k] = Z; SGL[k] = gl; SPR[k] = mprio;
+  if (memit) { SCOL[k] = pack(mr, mg, mb); return; }
+  const NX = F[0] * nx + F[1] * ny + F[2] * nz, NY = F[3] * nx + F[4] * ny + F[5] * nz;
+  const d = NX * sun[0] + NY * sun[1] + NZ * sun[2];
+  const lum = AMB + (d > 0 ? d * 1.1 * sunVis : 0);
+  const g = NX * SHINE[0] + NY * SHINE[1] + NZ * SHINE[2], s = g > 0 ? g * shineK : 0;   // warm light off the planet
+  SCOL[k] = pack(mr * (lum + s), mg * (lum + s * 0.82), mb * (lum + s * 0.6));
+}
+
+// a round tube from a to b; `seam` puts a dark joint every so often along it
+function gTube(ax, ay, az, bx, by, bz, r, seam) {
+  let dx = bx - ax, dy = by - ay, dz = bz - az;
+  const len = Math.hypot(dx, dy, dz); dx /= len; dy /= len; dz /= len;
+  let ux, uy, uz;
+  if (Math.abs(dz) < 0.9) { ux = -dy; uy = dx; uz = 0; } else { ux = 1 - dx * dx; uy = -dx * dy; uz = -dx * dz; }
+  const ul = Math.hypot(ux, uy, uz); ux /= ul; uy /= ul; uz /= ul;
+  const vx = dy * uz - dz * uy, vy = dz * ux - dx * uz, vz = dx * uy - dy * ux;
+  const nl = Math.ceil(len / stp) + 1, nv = Math.max(8, Math.ceil((TAU * r) / stp));
+  const br = mr, bg = mg, bb = mb;
+  for (let i = 0; i <= nl; i++) {
+    const t = (i / nl) * len, cx = ax + dx * t, cy = ay + dy * t, cz = az + dz * t;
+    const k = seam && (t % seam) < seam * 0.16 ? 0.5 : 1;
+    mr = br * k; mg = bg * k; mb = bb * k;
+    for (let j = 0; j < nv; j++) {
+      const a = (j / nv) * TAU, c = Math.cos(a), s = Math.sin(a);
+      const nx = ux * c + vx * s, ny = uy * c + vy * s, nz = uz * c + vz * s;
+      if (F[6] * nx + F[7] * ny + F[8] * nz < -0.02) continue;
+      emit(cx + nx * r, cy + ny * r, cz + nz * r, nx, ny, nz, 32);
+    }
+  }
+  mr = br; mg = bg; mb = bb;
+}
+// a line too thin to have a surface: a strut, a whip aerial
+function gWire(ax, ay, az, bx, by, bz, c, k) {
+  const dx = bx - ax, dy = by - ay, dz = bz - az, len = Math.hypot(dx, dy, dz);
+  const gl = dirGlyph(Math.atan2(F[3] * dx + F[4] * dy + F[5] * dz, F[0] * dx + F[1] * dy + F[2] * dz));
+  mat(c, 0, true, (k || 1) * (AMB + 0.2 + 0.6 * sunVis));
+  const n = Math.ceil(len / stp) + 1;
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    emit(ax + dx * t, ay + dy * t, az + dz * t, F[6], F[7], F[8], gl);
+  }
+}
+// a flat ring (or disc) facing along n
+function gDisc(cx, cy, cz, nx, ny, nz, r0, r1) {
+  if (F[6] * nx + F[7] * ny + F[8] * nz < 0) return;
+  let ux, uy, uz;
+  if (Math.abs(nz) < 0.9) { ux = -ny; uy = nx; uz = 0; } else { ux = 1; uy = 0; uz = 0; }
+  const ul = Math.hypot(ux, uy, uz); ux /= ul; uy /= ul; uz /= ul;
+  const vx = ny * uz - nz * uy, vy = nz * ux - nx * uz, vz = nx * uy - ny * ux;
+  for (let r = r0; r <= r1; r += stp) {
+    const n = Math.max(6, Math.ceil((TAU * r) / stp));
+    for (let j = 0; j < n; j++) {
+      const a = (j / n) * TAU, c = Math.cos(a) * r, s = Math.sin(a) * r;
+      emit(cx + ux * c + vx * s, cy + uy * c + vy * s, cz + uz * c + vz * s, nx, ny, nz, 32);
+    }
+  }
+}
+function gSphere(cx, cy, cz, r) {
+  const nlat = Math.ceil((Math.PI * r) / stp);
+  for (let i = 0; i <= nlat; i++) {
+    const la = (i / nlat - 0.5) * Math.PI, cl = Math.cos(la), sl = Math.sin(la);
+    const n = Math.max(1, Math.ceil((TAU * r * cl) / stp));
+    for (let j = 0; j < n; j++) {
+      const a = (j / n) * TAU, nx = cl * Math.cos(a), ny = cl * Math.sin(a);
+      emit(cx + nx * r, cy + ny * r, cz + sl * r, nx, ny, sl, i % 5 === 2 ? 45 : 32);
+    }
+  }
+}
+// a cone or frustum along z
+function gCone(z0, r0, z1, r1) {
+  const len = Math.abs(z1 - z0), sl = Math.hypot(len, r0 - r1), kr = len / sl, kz = ((r0 - r1) / sl) * Math.sign(z1 - z0);
+  const nl = Math.ceil(sl / stp) + 1;
+  for (let i = 0; i <= nl; i++) {
+    const t = i / nl, r = lerp(r0, r1, t), z = lerp(z0, z1, t), n = Math.max(6, Math.ceil((TAU * r) / stp));
+    for (let j = 0; j < n; j++) {
+      const a = (j / n) * TAU, c = Math.cos(a), s = Math.sin(a);
+      emit(c * r, s * r, z, c * kr, s * kr, kz, 32);
+    }
+  }
+}
+// a flat sheet seen from both sides; `solar` gives it cells on the sunward face
+function gRect(cx, cy, cz, ux, uy, uz, hu, vx, vy, vz, hv, solar) {
+  let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+  const face = F[6] * nx + F[7] * ny + F[8] * nz, front = face >= 0;
+  if (!front) { nx = -nx; ny = -ny; nz = -nz; }
+  let glint = 0;
+  if (solar && front) {                                            // the sun flashing off the glass
+    const NX = F[0] * nx + F[1] * ny + F[2] * nz, NY = F[3] * nx + F[4] * ny + F[5] * nz, NZ = Math.abs(face);
+    const d = NX * sun[0] + NY * sun[1] + NZ * sun[2];
+    if (d > 0) glint = Math.pow(clamp((2 * d * NZ - sun[2] - 0.86) / 0.14, 0, 1), 2) * sunVis;
+  }
+  const nu = Math.ceil((2 * hu) / stp), nv = Math.ceil((2 * hv) / stp);
+  for (let a = 0; a <= nu; a++) {
+    const fu = a / nu, su = (fu * 2 - 1) * hu, gu = fu * 3, lu = gu - (gu | 0) < 0.13 || a === nu;
+    for (let b = 0; b <= nv; b++) {
+      const fv = b / nv, sv = (fv * 2 - 1) * hv;
+      let gl = 32;
+      if (solar) {
+        const gv = fv * 4, line = lu || gv - (gv | 0) < 0.14 || b === nv;
+        if (!front) { mat(PANEL_BACK, 1); gl = line ? 61 : 32; }
+        else if (line) mat(PANEL_LINE, 2);
+        else { mat(PANEL, 1); gl = 35; }
+        if (glint) { mr = lerp(mr, 240, glint); mg = lerp(mg, 248, glint); mb = lerp(mb, 255, glint); }
+      }
+      emit(cx + ux * su + vx * sv, cy + uy * su + vy * sv, cz + uz * su + vz * sv, nx, ny, nz, gl);
+    }
+  }
+}
+// the habitat ring: a torus about z, turned by `rot`, split into modules with lit windows
+function gTorus(R, r, z0, rot, nseg, wins) {
+  const nu = Math.ceil((TAU * (R + r)) / stp), nv = Math.ceil((TAU * r) / stp);
+  for (let a = 0; a < nu; a++) {
+    const u0 = a / nu, ang = u0 * TAU + rot, cu = Math.cos(ang), su = Math.sin(ang);
+    const sf = u0 * nseg, seg = sf | 0, fr = sf - seg, seam = fr < 0.05 || fr > 0.95;
+    let wk = -1, won = false;
+    if (wins) {
+      if (fr > 0.2 && fr < 0.4) wk = 0; else if (fr > 0.6 && fr < 0.8) wk = 1;
+      if (wk >= 0) won = hash(seg * 4 + wk, Math.floor(time / 50 + hash(seg, wk, 31)), 37) < 0.72;
+    }
+    for (let b = 0; b < nv; b++) {
+      const v = (b / nv) * TAU, cv = Math.cos(v), sv = Math.sin(v);
+      const nx = cu * cv, ny = su * cv;
+      if (F[6] * nx + F[7] * ny + F[8] * sv < -0.02) continue;
+      let gl = 32;
+      const deg = v / DEG;
+      if (seam) mat(TRIM, 2);
+      else if (wk >= 0 && deg > 62 && deg < 118) {
+        if (won) mat(WINDOW, 3, true); else mat(WINDOW_OFF, 3);
+      }
+      else if (cv < -0.9) mat(TRIM, 2);                                           // a dark band round the inside
+      else { mat(HULL, 1); const h = hash(a >> 2, b >> 1, 5); if (h < 0.07) gl = h < 0.035 ? 46 : 45; }
+      emit((R + r * cv) * cu, (R + r * cv) * su, z0 + r * sv, nx, ny, sv, gl);
+    }
+  }
+}
+// a shallow dish opening along d
+function gDish(cx, cy, cz, dx, dy, dz, rd, depth) {
+  let ux, uy, uz;
+  if (Math.abs(dz) < 0.9) { ux = -dy; uy = dx; uz = 0; } else { ux = 1 - dx * dx; uy = -dx * dy; uz = -dx * dz; }
+  const ul = Math.hypot(ux, uy, uz); ux /= ul; uy /= ul; uz /= ul;
+  const vx = dy * uz - dz * uy, vy = dz * ux - dx * uz, vz = dx * uy - dy * ux;
+  for (let r = 0; r <= rd; r += stp) {
+    const n = Math.max(6, Math.ceil((TAU * r) / stp)), q = r / rd, h = depth * q * q, sl = (2 * depth * q) / rd;
+    const rib = ((q * 3.5) % 1) < 0.16 || q > 0.93;
+    for (let j = 0; j < n; j++) {
+      const a = (j / n) * TAU, c = Math.cos(a), s = Math.sin(a);
+      const rx = ux * c + vx * s, ry = uy * c + vy * s, rz = uz * c + vz * s;
+      let nx = dx - sl * rx, ny = dy - sl * ry, nz = dz - sl * rz;
+      const nl = Math.hypot(nx, ny, nz); nx /= nl; ny /= nl; nz /= nl;
+      const inside = F[6] * nx + F[7] * ny + F[8] * nz >= 0;
+      if (!inside) { nx = -nx; ny = -ny; nz = -nz; }
+      mat(inside ? (rib ? TRIM : DISH) : TRIM, rib ? 2 : 1, false, inside ? 1 : 0.8);
+      emit(cx + rx * r + dx * h, cy + ry * r + dy * h, cz + rz * r + dz * h, nx, ny, nz, 32);
+    }
+  }
+}
+
+function stepStation(dt) {
+  rot3(MS, 1.08 + 0.15 * Math.sin(time * 0.045), 0.1 * Math.sin(time * 0.031 + 1), -0.42 + 0.07 * Math.sin(time * 0.027 + 2));
+  st.wheel = (time * TAU) / 40;
+  st.dishA = time * 0.07;
+  // the solar wings swivel on their truss to face the sun, and hold still in the dark
+  if (sunVis > 0.3) {
+    const lx = MS[0] * sun[0] + MS[3] * sun[1] + MS[6] * sun[2], lz = MS[2] * sun[0] + MS[5] * sun[1] + MS[8] * sun[2];
+    st.panel += clamp(angleDiff(Math.atan2(lx, lz), st.panel), -0.25 * dt, 0.25 * dt);
+  }
+  OX = G.sx + 6 * Math.sin(time * 0.11); OY = G.sy + 5 * Math.sin(time * 0.083 + 1);
+  let gx = G.cx - G.sx, gy = G.cy - G.sy, gz = -0.7 * G.Rp;
+  const gl = Math.hypot(gx, gy, gz); gx /= gl; gy /= gl; gz /= gl;
+  SHINE[0] = gx; SHINE[1] = gy; SHINE[2] = gz;
+  shineK = 0.26 * (0.2 + 0.8 * clamp(0.5 - 0.5 * (sun[0] * gx + sun[1] * gy + sun[2] * gz), 0, 1));
+}
+
+const TRUSS_Z = -0.56, WHEEL_R = 0.55, WHEEL_T = 0.056;
+function buildStation() {
+  useStation();
+  // docking collar and the long spine
+  mat(TRIM, 2); gTube(0, 0, -0.94, 0, 0, -0.86, 0.085); gDisc(0, 0, -0.94, 0, 0, -1, 0.03, 0.085);
+  mat(HULL, 1); gTube(0, 0, -0.86, 0, 0, 0.48, 0.055, 0.11);
+  // solar wings on a truss
+  mat(TRIM, 2); gTube(0, -0.17, TRUSS_Z, 0, 0.17, TRUSS_Z, 0.03);
+  const pa = st.panel, wx = Math.cos(pa), wz = -Math.sin(pa);
+  for (const s of [-1, 1]) {
+    gWire(0, s * 0.17, TRUSS_Z, 0, s * 0.74, TRUSS_Z, TRIM, 1.5);
+    gRect(0, s * 0.33, TRUSS_Z, wx, 0, wz, 0.105, 0, 1, 0, 0.125, true);
+    gRect(0, s * 0.61, TRUSS_Z, wx, 0, wz, 0.105, 0, 1, 0, 0.125, true);
+  }
+  // fuel tanks
+  mat(FOIL, 1);
+  for (let k = 0; k < 4; k++) { const a = k * TAU / 4 + TAU / 8; gSphere(0.118 * Math.cos(a), 0.118 * Math.sin(a), -0.27, 0.078); }
+  // hub, spokes and the big wheel
+  mat(HULL, 1); gTube(0, 0, -0.06, 0, 0, 0.06, 0.13);
+  mat(ACCENT, 2); gTube(0, 0, -0.016, 0, 0, 0.016, 0.133);
+  mat(HULL, 1, false, 0.9); gDisc(0, 0, 0.06, 0, 0, 1, 0.055, 0.13); gDisc(0, 0, -0.06, 0, 0, -1, 0.055, 0.13);
+  for (let k = 0; k < 4; k++) {
+    const a = st.wheel + (k * TAU) / 4, c = Math.cos(a), s = Math.sin(a);
+    mat(HULL, 1, false, 0.92); gTube(0.13 * c, 0.13 * s, 0, (WHEEL_R - WHEEL_T) * c, (WHEEL_R - WHEEL_T) * s, 0, 0.02, 0.09);
+  }
+  gTorus(WHEEL_R, WHEEL_T, 0, st.wheel, 20, true);
+  // comms section, the dish and a couple of whip aerials
+  mat(HULL, 1); gTube(0, 0, 0.48, 0, 0, 0.62, 0.085, 0.07);
+  mat(TRIM, 2); gDisc(0, 0, 0.62, 0, 0, 1, 0, 0.085);
+  const da = st.dishA;
+  let dx = 0.75 * Math.cos(da), dy = 0.75 * Math.sin(da), dz = 0.66;
+  const dl = Math.hypot(dx, dy, dz); dx /= dl; dy /= dl; dz /= dl;
+  gWire(0, 0, 0.62, 0, 0, 0.75, TRIM, 1.6);
+  gDish(0, 0, 0.75, dx, dy, dz, 0.135, 0.05);
+  gWire(0, 0, 0.75, dx * 0.11, dy * 0.11, 0.75 + dz * 0.11, HULL, 1.2);
+  gWire(0.08, 0, 0.55, 0.3, 0.05, 0.7, HULL, 1);
+  gWire(-0.08, 0, 0.55, -0.26, -0.08, 0.72, HULL, 1);
+}
+
+// ---------- the shuttle ----------
+// It comes in from far off, brakes, docks nose-first, sits a while, then
+// backs out, swings round and burns away.
+const KS = 1.3;                           // shuttle scale
+const DOCK_Z = -(0.94 + 0.135 * KS);
+const rsh = mulberry(SEED ^ 0x9e3779b9);
+const shut = { mode: "away", t: 0, dur: 4, pos: [0, 0, -9], dir: [0, 0, 1], ax: 0.9, ay: 0.6, bx: 0.5, by: -0.5, ts: 1, main: false, retro: false, side: 0, acc: 0 };
+const sparks = [];
+
+function approachAt(u, out) {
+  const e = 1 - Math.pow(1 - u, 2.4), k = Math.pow(1 - e, 1.5);
+  out[0] = shut.ax * k; out[1] = shut.ay * k; out[2] = DOCK_Z - 5.6 * (1 - e);
+}
+const TMP = [0, 0, 0];
+function stepShuttle(dt) {
+  const s = shut;
+  s.t += dt;
+  if (s.t >= s.dur) {
+    s.t = 0;
+    if (s.mode === "away") { s.mode = "approach"; s.dur = 24; s.ax = (rsh() - 0.5) * 2.4; s.ay = (rsh() - 0.5) * 2; }
+    else if (s.mode === "approach") { s.mode = "docked"; s.dur = 22 + 18 * rsh(); }
+    else if (s.mode === "docked") { s.mode = "backout"; s.dur = 5; }
+    else if (s.mode === "backout") { s.mode = "turn"; s.dur = 4.5; s.ts = rsh() < 0.5 ? -1 : 1; }
+    else if (s.mode === "turn") { s.mode = "depart"; s.dur = 14; s.bx = (rsh() - 0.5) * 2; s.by = (rsh() - 0.5) * 2; }
+    else { s.mode = "away"; s.dur = 10 + 16 * rsh(); }
+  }
+  const u = s.t / s.dur;
+  s.main = s.retro = false; s.side = 0;
+  if (s.mode === "approach") {
+    approachAt(u, s.pos); approachAt(Math.min(1, u + 0.01), TMP);
+    let dx = TMP[0] - s.pos[0], dy = TMP[1] - s.pos[1], dz = TMP[2] - s.pos[2];
+    const l = Math.hypot(dx, dy, dz);
+    if (l > 1e-6) { s.dir[0] = dx / l; s.dir[1] = dy / l; s.dir[2] = dz / l; } else { s.dir[0] = 0; s.dir[1] = 0; s.dir[2] = 1; }
+    s.retro = u > 0.3 && u < 0.93 && Math.sin(s.t * 4) > 0.25;
+  } else if (s.mode === "docked") {
+    s.pos[0] = 0; s.pos[1] = 0; s.pos[2] = DOCK_Z; s.dir[0] = 0; s.dir[1] = 0; s.dir[2] = 1;
+  } else if (s.mode === "backout") {
+    s.pos[0] = 0; s.pos[1] = 0; s.pos[2] = DOCK_Z - 0.45 * smooth(u);
+    s.retro = u < 0.35;
+  } else if (s.mode === "turn") {
+    const a = Math.PI * smooth(u);
+    s.dir[0] = Math.sin(a) * s.ts; s.dir[1] = 0; s.dir[2] = Math.cos(a);
+    s.side = u < 0.22 ? s.ts : u > 0.78 ? -s.ts : 0;
+  } else if (s.mode === "depart") {
+    const d = 7.5 * u * u, k = smooth(Math.min(1, u * 4));
+    s.pos[0] = s.bx * 0.3 * d * k; s.pos[1] = s.by * 0.3 * d * k; s.pos[2] = DOCK_Z - 0.45 - d;
+    const l = Math.hypot(s.bx * 0.3 * k, s.by * 0.3 * k, 1);
+    s.dir[0] = (s.bx * 0.3 * k) / l; s.dir[1] = (s.by * 0.3 * k) / l; s.dir[2] = -1 / l;
+    s.main = u < 0.7;
+  }
+  // exhaust
+  if (s.mode !== "away" && (s.main || s.retro || s.side)) {
+    s.acc += dt * (s.main ? 46 : 22);
+    const S = G.S, d = s.dir;
+    while (s.acc >= 1) {
+      s.acc -= 1;
+      let ox = 0, oy = 0, oz = 0, vx, vy, vz;
+      if (s.main) { ox = -d[0] * 0.15 * KS; oy = -d[1] * 0.15 * KS; oz = -d[2] * 0.15 * KS; vx = -d[0]; vy = -d[1]; vz = -d[2]; }
+      else if (s.retro) { ox = d[0] * 0.1 * KS; oy = d[1] * 0.1 * KS; oz = d[2] * 0.1 * KS; vx = d[0] + (Math.random() - 0.5); vy = d[1] + (Math.random() - 0.5); vz = d[2]; }
+      else { ox = d[0] * 0.09 * KS; oz = d[2] * 0.09 * KS; vx = -d[2] * s.side; vy = 0; vz = d[0] * s.side; }
+      const x = s.pos[0] + ox, y = s.pos[1] + oy, z = s.pos[2] + oz;
+      const sp = (s.main ? 150 : 70) * (0.6 + 0.8 * Math.random()) * (S / 300);
+      sparks.push({
+        x: OX + (MS[0] * x + MS[1] * y + MS[2] * z) * S, y: OY + (MS[3] * x + MS[4] * y + MS[5] * z) * S,
+        vx: (MS[0] * vx + MS[1] * vy + MS[2] * vz) * sp + (Math.random() - 0.5) * 24,
+        vy: (MS[3] * vx + MS[4] * vy + MS[5] * vz) * sp + (Math.random() - 0.5) * 24,
+        t: 0, life: (s.main ? 0.7 : 0.4) * (0.6 + 0.8 * Math.random()), hot: s.main,
+      });
+    }
+  }
+  for (let i = sparks.length - 1; i >= 0; i--) {
+    const p = sparks[i];
+    p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.t >= p.life) { sparks[i] = sparks[sparks.length - 1]; sparks.pop(); }
+  }
+}
+const XA = [1, 0, 0], YA = [0, 1, 0];
+function shuttleFrame() {
+  const d = shut.dir;
+  let xa = cross(YA, d), l = Math.hypot(xa[0], xa[1], xa[2]);
+  if (l < 1e-3) { xa = cross(XA, d); l = Math.hypot(xa[0], xa[1], xa[2]); }
+  xa[0] /= l; xa[1] /= l; xa[2] /= l;
+  useLocal(xa, cross(d, xa), d, shut.pos);
+}
+function buildShuttle() {
+  if (shut.mode === "away") return;
+  shuttleFrame();
+  const k = KS;
+  mat(HULL, 1); gTube(0, 0, -0.1 * k, 0, 0, 0.06 * k, 0.036 * k, 0.055 * k);
+  mat(ACCENT, 2); gTube(0, 0, 0.012 * k, 0, 0, 0.032 * k, 0.038 * k);
+  mat(TRIM, 2); gCone(0.06 * k, 0.036 * k, 0.13 * k, 0.012 * k);
+  gDisc(0, 0, 0.13 * k, 0, 0, 1, 0, 0.012 * k);
+  gCone(-0.1 * k, 0.02 * k, -0.145 * k, 0.034 * k);
+  mat(TRIM, 1, false, 0.7); gDisc(0, 0, -0.1 * k, 0, 0, -1, 0, 0.036 * k);
+  mat(HULL, 1, false, 0.82); gRect(0, 0, -0.055 * k, 1, 0, 0, 0.1 * k, 0, 0, 1, 0.036 * k, false);
+}
+
+// ---------- drawing ----------
+const renderer = {
+  canvas: null, ctx: null, dpr: 1,
+  cw: 10, ch: 15, cols: 0, rows: 0, font: "monospace",
+  flag: new Uint8Array(0), glyph: new Uint16Array(0),
+  colour: new Uint32Array(0), fill: new Uint32Array(0),
+  act: new Int32Array(0),
+
+  resize(w, h, dpr) {
+    this.dpr = dpr;
+    this.cw = clamp(Math.round(w / 260), 4, 8);
+    this.ch = Math.round(this.cw * 1.5);
+    this.cols = Math.ceil(w / this.cw);
+    this.rows = Math.ceil(h / this.ch);
+    const n = this.cols * this.rows;
+    this.flag = new Uint8Array(n); this.glyph = new Uint16Array(n);
+    this.colour = new Uint32Array(n); this.fill = new Uint32Array(n);
+    this.canvas.width = Math.round(w * dpr);
+    this.canvas.height = Math.round(h * dpr);
+
+    const m = Math.min(w, h);
+    G.Rp = m * 0.36; G.cx = w * 0.3; G.cy = h * 0.72;
+    G.S = m * 0.36; G.sx = w * 0.72; G.sy = h * 0.35;
+
+    // the sub-cell depth buffer the station is drawn into
+    SW = this.cols * 2; SH = this.rows * 3; IQX = 2 / this.cw; IQY = 3 / this.ch;
+    SZ = new Float32Array(SW * SH); SCOL = new Uint32Array(SW * SH); SGL = new Uint16Array(SW * SH); SPR = new Uint8Array(SW * SH);
+    stp = (0.6 * Math.min(this.cw / 2, this.ch / 3)) / G.S;
+
+    // The camera never moves against the planet, so where each cell's line of
+    // sight meets the globe and the ring plane is worked out once, here.
+    const f32 = () => new Float32Array(n);
+    this.pcov = f32(); this.pnx = f32(); this.pny = f32(); this.pnz = f32(); this.psl = f32(); this.plon = f32();
+    this.rr0 = f32(); this.rr1 = f32(); this.rr2 = f32(); this.rth = f32();
+    this.rqx = f32(); this.rqy = f32(); this.rqz = f32(); this.rom = f32(); this.rk = f32();
+    this.rlane = new Int32Array(n); this.rdir = new Uint16Array(n);
+    const { cw, ch, cols, rows } = this, Rp = G.Rp, span = (cw + ch) / 2;
+    const laneW = cw * 1.3, alongW = cw * 2.2, act = [];
+    const ringR0 = (dx, dy) => { const z = -(dx * P[0] + dy * P[1]) / P[2]; return Math.sqrt(dx * dx + dy * dy + z * z); };
+    for (let r = 0; r < rows; r++)
+      for (let c = 0; c < cols; c++) {
+        const i = r * cols + c, dx = ((c + 0.5) * cw - G.cx) / Rp, dy = ((r + 0.5) * ch - G.cy) / Rp;
+        const d2 = dx * dx + dy * dy, d = Math.sqrt(d2);
+        const cov = clamp(((1 - d) * Rp) / span + 0.5, 0, 1);
+        let on = false, nz = 0;
+        if (cov > 0) {
+          let nx = dx, ny = dy;
+          if (d2 < 1) nz = Math.sqrt(1 - d2); else { nx /= d; ny /= d; }
+          this.pcov[i] = cov; this.pnx[i] = nx; this.pny[i] = ny; this.pnz[i] = nz;
+          this.psl[i] = nx * P[0] + ny * P[1] + nz * P[2];
+          this.plon[i] = Math.atan2(nx * E2[0] + ny * E2[1] + nz * E2[2], nx * E1[0] + ny * E1[1] + nz * E1[2]);
+          on = true;
+        }
+        const zr = -(dx * P[0] + dy * P[1]) / P[2], rc = Math.sqrt(d2 + zr * zr);
+        const oy = ch / 3 / Rp, ra = ringR0(dx, dy - oy), rb = ringR0(dx, dy + oy);
+        const inR = (v) => v > RMIN && v < RMAX;
+        if ((inR(rc) || inR(ra) || inR(rb)) && !(d2 < 1 && zr < nz)) {
+          this.rr0[i] = inR(ra) ? ra : 0; this.rr1[i] = rc; this.rr2[i] = inR(rb) ? rb : 0;
+          this.rqx[i] = dx; this.rqy[i] = dy; this.rqz[i] = zr;
+          const th = Math.atan2(dx * E2[0] + dy * E2[1] + zr * E2[2], dx * E1[0] + dy * E1[1] + zr * E1[2]);
+          this.rth[i] = th;
+          const lane = ((rc * Rp) / laneW) | 0, rl = ((lane + 0.5) * laneW) / Rp;
+          this.rlane[i] = lane;
+          this.rom[i] = OMEGA0 / (rl * Math.sqrt(rl)) - CAM_RATE;
+          this.rk[i] = (rl * Rp) / alongW;
+          // which way the ring runs across this cell
+          const tx = -Math.sin(th) * E1[0] + Math.cos(th) * E2[0], ty = -Math.sin(th) * E1[1] + Math.cos(th) * E2[1];
+          this.rdir[i] = dirGlyph(Math.atan2(ty * ch / cw, tx));
+          on = true;
+        }
+        if (on) act.push(i);
+      }
+    this.act = Int32Array.from(act);
+  },
+
+  cellIndex(x, y) {
+    const c = Math.floor(x / this.cw), r = Math.floor(y / this.ch);
+    return c < 0 || r < 0 || c >= this.cols || r >= this.rows ? -1 : r * this.cols + c;
+  },
+  bare(i, gl, col) {
+    if (!this.flag[i]) { this.flag[i] = 1; this.fill[i] = 0; }
+    this.glyph[i] = gl; this.colour[i] = col;
+  },
+
+  drawStars() {
+    for (const s of stars) {
+      const i = this.cellIndex(s.x, s.y);
+      if (i < 0) continue;
+      const b = s.b * (0.72 + 0.28 * Math.sin(time * s.f + s.ph));
+      const c = s.tint < 0.14 ? [255, 210, 168] : s.tint < 0.3 ? [168, 198, 255] : [222, 228, 242];
+      this.bare(i, s.b > 0.9 ? 42 : s.b > 0.72 ? 43 : 46, pack(c[0] * b, c[1] * b, c[2] * b));
+    }
+  },
+
+  drawPlanet() {
+    const { flag, glyph, colour, fill, act, pcov, pnx, pny, pnz, psl, plon, rr0, rr1, rr2, rth, rqx, rqy, rqz, rom, rk, rlane, rdir } = this;
+    const Lx = sun[0], Ly = sun[1], Lz = sun[2], Lp = Lx * P[0] + Ly * P[1] + Lz * P[2];
+    const stormLon = storm0 + time * bandSpeed[stormBand];
+    for (let a = 0; a < act.length; a++) {
+      const i = act[a], cov = pcov[i];
+      let solid = false, fr = 0, fg = 0, fb = 0, gl = 32, ink = 0.74, rim = 0, bright = false;
+      if (cov > 0) {
+        const nx = pnx[i], ny = pny[i], nz = pnz[i], sl = psl[i], lon = plon[i];
+        let lit = clamp((nx * Lx + ny * Ly + nz * Lz) * 1.5 + 0.1, 0, 1);
+        lit = lit * lit * (3 - 2 * lit);
+        if (lit > 0 && sl * Lp < 0) {                              // the rings' shadow across the cloud tops
+          const t = -sl / Lp, hx = nx + t * Lx, hy = ny + t * Ly, hz = nz + t * Lz, r = Math.sqrt(hx * hx + hy * hy + hz * hz);
+          if (r > RMIN && r < RMAX) lit *= 1 - 0.8 * ringOp[((r - RMIN) * RK) | 0];
+        }
+        // belts: each slides round at its own speed, with a churning edge
+        const f = (sl * 0.5 + 0.5) * NB;
+        let jb = f | 0; if (jb >= NB) jb = NB - 1;
+        const q = f - jb, u = (lon - time * bandSpeed[jb]) / TAU, x = (u - Math.floor(u)) * NX;
+        const wob = (pnoise(x, q * 2, NX, SEED + jb * 7) - 0.5) * Math.sin(Math.PI * q) * 1.7;
+        const ti = clamp(((f + wob) / NB * 255) | 0, 0, 255) * 3;
+        let br = BT[ti], bg = BT[ti + 1], bb = BT[ti + 2];
+        const th = hash((x * 5) | 0, (q * 3) | 0, 200 + jb);
+        let pg = th < 0.5 ? 32 : th < 0.76 ? 126 : th < 0.89 ? 45 : th < 0.96 ? 61 : 58;
+        const ds = sl - STORM_SL;
+        if (ds > -0.11 && ds < 0.11) {                             // the great storm
+          const dl = angleDiff(lon, stormLon) * Math.sqrt(1 - sl * sl), e = (dl / 0.27) * (dl / 0.27) + (ds / 0.1) * (ds / 0.1);
+          if (e < 1) {
+            const k = smooth(1 - e) * 0.92;
+            br = lerp(br, STORM[0], k); bg = lerp(bg, STORM[1], k); bb = lerp(bb, STORM[2], k);
+            pg = e < 0.08 ? 64 : e < 0.4 ? 79 : e < 0.75 ? 111 : 126;
+          }
+        }
+        const ld = 0.4 + 0.6 * nz, nk = 0.55 + 0.45 * nz;
+        let r = lerp(NIGHT[0] * nk, br * ld, lit), g = lerp(NIGHT[1] * nk, bg * ld, lit), b = lerp(NIGHT[2] * nk, bb * ld, lit);
+        const at = 1 - nz, a4 = at * at * at * lit * 0.55;
+        r = lerp(r, ATMOS[0], a4); g = lerp(g, ATMOS[1], a4); b = lerp(b, ATMOS[2], a4);
+        fr = r; fg = g; fb = b;
+        if (cov >= 0.5) { solid = true; gl = pg; }
+        else rim = cov < 0.22 ? 46 : 58;
+      }
+      const rc = rr1[i];
+      if (rc > 0) {
+        let op = 0, cr = 0, cg = 0, cb = 0;
+        for (let k = 0; k < 3; k++) {
+          const rs = k === 0 ? rr0[i] : k === 1 ? rc : rr2[i];
+          if (rs <= RMIN || rs >= RMAX) continue;
+          const j = ((rs - RMIN) * RK) | 0, o = ringOp[j];
+          op += o; cr += o * ringR[j]; cg += o * ringG[j]; cb += o * ringB[j];
+        }
+        if (op > 0.02) {
+          cr /= op; cg /= op; cb /= op; op /= 3;
+          // the planet's shadow lying across the rings
+          const bq = rqx[i] * Lx + rqy[i] * Ly + rqz[i] * Lz;
+          let sh = 0;
+          if (bq < 0) sh = smooth(1 - clamp((Math.sqrt(Math.max(0, rc * rc - bq * bq)) - 0.95) / 0.08, 0, 1));
+          const lane = rlane[i], light = (1 - 0.9 * sh) * (0.86 + 0.14 * hash(lane, 0, 3));
+          cr *= light; cg *= light; cb *= light;
+          // grains of ice streaming round, each lane at its own pace
+          const along = Math.floor((rth[i] - rom[i] * time) * rk[i]);
+          const h = hash(along, lane, 91);
+          const rgl = h < 0.52 ? 32 : h < 0.84 ? rdir[i] : h < 0.955 ? 46 : 42;
+          if (solid) {
+            fr = lerp(fr, cr, op); fg = lerp(fg, cg, op); fb = lerp(fb, cb, op);
+            if (op > 0.4) { gl = rgl; bright = rgl === 42 && sh < 0.5; }
+          } else if (op >= 0.3) {
+            const t = 0.25 + 0.75 * op;
+            solid = true; fr = lerp(BG[0], cr, t); fg = lerp(BG[1], cg, t); fb = lerp(BG[2], cb, t);
+            gl = rgl; bright = rgl === 42 && sh < 0.5;
+          } else if (hash(along, lane, 93) < op * 1.9) {
+            rim = h < 0.6 ? 46 : rdir[i]; fr = cr; fg = cg; fb = cb;
+          }
+        }
+      }
+      if (solid) {
+        flag[i] = 1; fill[i] = pack(fr, fg, fb); glyph[i] = gl;
+        colour[i] = bright ? pack(fr * 1.25 + 30, fg * 1.25 + 30, fb * 1.25 + 30) : pack(fr * ink, fg * ink, fb * ink);
+      } else if (rim) {
+        flag[i] = 1; fill[i] = 0; glyph[i] = rim; colour[i] = pack(fr, fg, fb);
+      }
+    }
+  },
+
+  drawMoons() {
+    const { cw, ch, cols, rows } = this, Rp = G.Rp, span = (cw + ch) / 2;
+    for (const m of MOONS) {
+      const th = m.th + (OMEGA0 / (m.r * Math.sqrt(m.r)) - CAM_RATE) * time, c = Math.cos(th) * m.r, s = Math.sin(th) * m.r;
+      const qx = c * E1[0] + s * E2[0], qy = c * E1[1] + s * E2[1], qz = c * E1[2] + s * E2[2];
+      const mx = G.cx + qx * Rp, my = G.cy + qy * Rp, rad = Math.max(m.size * Rp, span * 0.9);
+      if (mx < -rad || my < -rad || mx > W + rad || my > H + rad) continue;
+      // is it inside the planet's shadow?
+      const b = qx * sun[0] + qy * sun[1] + qz * sun[2];
+      const dark = b < 0 && m.r * m.r - b * b < 1 ? 0.1 : 1;
+      const c0 = Math.max(0, Math.floor((mx - rad) / cw) - 1), c1 = Math.min(cols - 1, Math.ceil((mx + rad) / cw) + 1);
+      const r0 = Math.max(0, Math.floor((my - rad) / ch) - 1), r1 = Math.min(rows - 1, Math.ceil((my + rad) / ch) + 1);
+      for (let r = r0; r <= r1; r++)
+        for (let cc = c0; cc <= c1; cc++) {
+          const i = r * cols + cc, dx = ((cc + 0.5) * cw - mx) / rad, dy = ((r + 0.5) * ch - my) / rad, d = Math.hypot(dx, dy);
+          const cov = clamp(((1 - d) * rad) / span + 0.5, 0, 1);
+          if (cov <= 0) continue;
+          if (this.pcov[i] >= 0.5 && qz < this.pnz[i]) continue;   // behind the planet
+          const nz = d < 1 ? Math.sqrt(1 - d * d) : 0;
+          const lit = AMB + dark * Math.max(0, dx * sun[0] + dy * sun[1] + nz * sun[2]);
+          const col = pack(m.col[0] * lit, m.col[1] * lit, m.col[2] * lit);
+          if (cov >= 0.5) {
+            this.flag[i] = 1; this.fill[i] = col;
+            this.glyph[i] = hash(cc, r, 60) < 0.3 ? 111 : 32;      // a crater or two
+            this.colour[i] = pack(m.col[0] * lit * 0.7, m.col[1] * lit * 0.7, m.col[2] * lit * 0.7);
+          } else this.bare(i, 46, col);
+        }
+    }
+  },
+
+  // turn the depth buffer into cells
+  resolve() {
+    const { cols, rows, flag, glyph, colour, fill } = this;
+    for (let r = 0; r < rows; r++)
+      for (let c = 0; c < cols; c++) {
+        const base = r * 3 * SW + c * 2;
+        let n = 0, zmax = -1e9, rowsum = 0;
+        for (let dj = 0; dj < 3; dj++)
+          for (let di = 0; di < 2; di++) {
+            const z = SZ[base + dj * SW + di];
+            if (z > -1e8) { n++; rowsum += dj; if (z > zmax) zmax = z; }
+          }
+        if (!n) continue;
+        let best = -1, bp = -1, bz = -1e9;
+        for (let dj = 0; dj < 3; dj++)
+          for (let di = 0; di < 2; di++) {
+            const k = base + dj * SW + di, z = SZ[k];
+            if (z < zmax - 0.05) continue;
+            const p = SPR[k];
+            if (p > bp || (p === bp && z > bz)) { best = k; bp = p; bz = z; }
+          }
+        const i = r * cols + c, col = SCOL[best], gl = SGL[best];
+        const cr = col >>> 16, cg = (col >>> 8) & 255, cb = col & 255;
+        if (n >= 4 && bp > 0) {
+          flag[i] = 1; fill[i] = col; glyph[i] = gl;
+          colour[i] = bp === 3 ? pack(cr * 0.7, cg * 0.7, cb * 0.7) : pack(cr * 0.58, cg * 0.58, cb * 0.58);
+        } else {
+          let g = gl;
+          if (g === 32) {
+            const cy = rowsum / n;
+            g = cy < 0.7 ? (n === 1 ? 39 : 34) : cy > 1.3 ? (n === 1 ? 46 : 95) : n === 1 ? 45 : 58;
+          }
+          this.bare(i, g, col);
+        }
+      }
+  },
+
+  // a lamp on the station, hidden when hull is in the way
+  lamp(x, y, z, col, on) {
+    if (!on) return;
+    const px = OX + (F[0] * x + F[1] * y + F[2] * z + T[0]) * G.S, py = OY + (F[3] * x + F[4] * y + F[5] * z + T[1]) * G.S;
+    const sx = (px * IQX) | 0, sy = (py * IQY) | 0;
+    if (px < 0 || py < 0 || sx >= SW || sy >= SH) return;
+    if (SZ[sy * SW + sx] > F[6] * x + F[7] * y + F[8] * z + T[2] + 0.03) return;
+    const i = this.cellIndex(px, py);
+    if (i < 0) return;
+    this.bare(i, 42, pack(col[0], col[1], col[2]));
+    const dim = pack(col[0] * 0.55, col[1] * 0.55, col[2] * 0.55), c = i % this.cols;
+    if (c > 0 && !this.flag[i - 1]) this.bare(i - 1, 45, dim);
+    if (c < this.cols - 1 && !this.flag[i + 1]) this.bare(i + 1, 45, dim);
+  },
+
+  drawStation() {
+    SZ.fill(-1e9);
+    buildStation();
+    buildShuttle();
+    this.resolve();
+    useStation();
+    const t = time;
+    this.lamp(0, -0.75, TRUSS_Z, [255, 64, 56], t % 1.6 < 0.3);
+    this.lamp(0, 0.75, TRUSS_Z, [80, 255, 130], t % 1.6 < 0.3);
+    const fl = t % 2.4;
+    this.lamp(0, 0, 0.76, [255, 255, 255], fl < 0.09 || (fl > 0.22 && fl < 0.31));
+    for (let k = 0; k < 2; k++) {
+      const a = st.wheel + TAU / 8 + k * Math.PI, R = WHEEL_R + WHEEL_T + 0.004;
+      this.lamp(R * Math.cos(a), R * Math.sin(a), 0, [255, 190, 90], (t + k * 0.6) % 1.2 < 0.6);
+    }
+    if (shut.mode !== "away") {
+      shuttleFrame();
+      this.lamp(0, -0.04 * KS, -0.08 * KS, [255, 255, 255], shut.mode !== "docked" && t % 0.9 < 0.15);
+    }
+  },
+
+  drawSparks() {
+    for (const p of sparks) {
+      const i = this.cellIndex(p.x, p.y);
+      if (i < 0) continue;
+      const u = p.t / p.life, k = 1 - u * 0.75;
+      const col = p.hot ? pack(lerp(255, 120, u) * k, lerp(244, 150, u) * k, lerp(200, 255, u) * k) : pack(220 * k, 232 * k, 255 * k);
+      this.bare(i, u < 0.3 ? 42 : u < 0.65 ? 43 : 46, col);
+    }
+  },
+
+  render() {
+    const { ctx, dpr, cols, cw, ch } = this;
+    this.flag.fill(0);
+    this.drawStars();
+    this.drawPlanet();
+    this.drawMoons();
+    this.drawStation();
+    this.drawSparks();
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = `rgb(${BG})`;
+    ctx.fillRect(0, 0, W, H);
+
+    // one character per occupied cell
+    ctx.font = `600 ${Math.round(ch * 0.78)}px ${this.font}`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    let lastStyle = "";
+    for (let i = 0; i < this.flag.length; i++) {
+      if (!this.flag[i]) continue;
+      const x = (i % cols) * cw, y = ((i / cols) | 0) * ch;
+      if (this.fill[i]) {
+        const fs = css(this.fill[i]);
+        if (fs !== lastStyle) ctx.fillStyle = lastStyle = fs;
+        ctx.fillRect(x + 1, y + 1, cw - 1, ch - 1);
+      }
+      const g = this.glyph[i];
+      if (g === 32) continue;
+      const gs = css(this.colour[i]);
+      if (gs !== lastStyle) ctx.fillStyle = lastStyle = gs;
+      ctx.fillText(String.fromCharCode(g), x + cw / 2, y + ch / 2 + ch * 0.06);
+    }
+  },
+};
+
+// ---------- boot ----------
+const canvas = document.querySelector("canvas");
+renderer.canvas = canvas;
+renderer.ctx = canvas.getContext("2d", { alpha: false });
+renderer.font = getComputedStyle(canvas).fontFamily || "monospace";
+buildPlanet();
+
+function tick(dt) {
+  time += dt;
+  stepSun();
+  stepStars(dt);
+  stepStation(dt);
+  stepShuttle(dt);
+}
+
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  if (w < 1 || h < 1) return;
+  W = w; H = h;
+  renderer.resize(w, h, Math.min(window.devicePixelRatio || 1, 2));
+  buildStars();
+  sparks.length = 0;
+  tick(0);
+  renderer.render();
+}
+
+// Frames drawn per second; override with ?fps=20 etc.
+const FPS = clamp(Number(params.get("fps")) || 30, 5, 120);
+const still = window.matchMedia("(prefers-reduced-motion: reduce)");
+let last = 0;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 1000 / FPS - 2) return;                         // not time for the next frame yet
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  tick(dt);
+  renderer.render();
+}
+
+window.addEventListener("resize", resize);
+resize();
+// ?t=20 starts the scene 20 seconds in
+for (let i = 0, n = Math.round((Number(params.get("t")) || 0) * 30); i < n; i++) tick(1 / 30);
+renderer.render();
+if (!still.matches) {
+  last = performance.now();
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
