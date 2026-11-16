@@ -1,0 +1,1313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ascii freight depot</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #04060d; overflow: hidden; }
+  canvas {
+    display: block; width: 100vw; height: 100vh;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+</style>
+</head>
+<body>
+<canvas aria-hidden="true"></canvas>
+<script>
+"use strict";
+
+// ---------- small helpers ----------
+const TAU = Math.PI * 2;
+const DEG = Math.PI / 180;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (t) => t * t * (3 - 2 * t);
+
+function hash(x, y, s) {
+  let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(s | 0, 1274126177)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function noise1(x, s) {
+  const xi = Math.floor(x), u = smooth(x - xi);
+  return lerp(hash(xi, 0, s), hash(xi + 1, 0, s), u);
+}
+// 2D noise that repeats every `per` units of x, so it can wrap around a planet
+function pnoise(x, y, per, s) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const u = smooth(x - xi), v = smooth(y - yi);
+  const x0 = ((xi % per) + per) % per, x1 = (x0 + 1) % per;
+  return lerp(
+    lerp(hash(x0, yi, s), hash(x1, yi, s), u),
+    lerp(hash(x0, yi + 1, s), hash(x1, yi + 1, s), u),
+    v
+  );
+}
+function angleDiff(a, b) {
+  let d = (a - b) % TAU;
+  if (d > Math.PI) d -= TAU;
+  if (d < -Math.PI) d += TAU;
+  return d;
+}
+function mulberry(a) {
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const pack = (r, g, b) => (clamp(r | 0, 0, 255) << 16) | (clamp(g | 0, 0, 255) << 8) | clamp(b | 0, 0, 255);
+const cssCache = new Map();
+function css(c) {
+  c &= 0xf8f8f8;
+  let v = cssCache.get(c);
+  if (v === undefined) cssCache.set(c, (v = `rgb(${c >>> 16},${(c >>> 8) & 255},${c & 255})`));
+  return v;
+}
+// A line drawn at this angle looks most like which character?
+function dirGlyph(a) {
+  a = ((a % Math.PI) + Math.PI) % Math.PI;
+  if (a < Math.PI / 8 || a >= (7 * Math.PI) / 8) return 45;   // -
+  if (a < (3 * Math.PI) / 8) return 92;                        // \
+  if (a < (5 * Math.PI) / 8) return 124;                       // |
+  return 47;                                                   // /
+}
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+
+// ---------- look ----------
+const params = new URLSearchParams(location.search);
+const SEED = Number(params.get("seed")) || 1 + ((Math.random() * 1e6) | 0);   // ?seed=123 to keep a planet
+const ORBIT = clamp(Number(params.get("orbit")) || 480, 30, 36000);           // seconds for one lap around the planet
+const BG = [4, 6, 13];
+const NIGHT = [12, 22, 42];               // the planet's unlit side
+const ATMOS = [206, 240, 255];            // haze along the sunlit limb
+const STORM = [30, 52, 104];
+const BANDS = [                           // cloud belts are picked from these
+  [150, 206, 214], [108, 176, 196], [84, 150, 184], [190, 226, 228],
+  [70, 128, 170], [128, 192, 204], [214, 236, 234], [96, 160, 190],
+];
+const POLE = [52, 96, 146];
+const RINGS = [                           // inner edge, outer edge (planet radii), opacity, colour
+  [1.22, 1.33, 0.22, [112, 124, 148]],
+  [1.39, 1.86, 0.92, [210, 220, 234]],
+  [1.92, 2.02, 0.50, [140, 162, 198]],
+  [2.10, 2.30, 0.80, [226, 208, 214]],
+  [2.38, 2.42, 0.74, [240, 242, 250]],
+  [2.50, 2.54, 0.60, [170, 190, 226]],
+  [2.66, 2.92, 0.28, [104, 142, 196]],
+];
+const MOONS = [                           // orbit radius, size (planet radii), where it starts, colour
+  { r: 2.62, size: 0.030, th: 0.6, col: [200, 196, 190] },
+  { r: 3.25, size: 0.058, th: 3.9, col: [214, 190, 158] },
+  { r: 4.10, size: 0.044, th: 4.6, col: [176, 198, 222] },
+];
+const CONC = [156, 154, 148];             // raw concrete
+const STEEL = [112, 118, 130];
+const WINDOW = [255, 208, 120];
+const GLASS = [26, 32, 46];               // an unlit window
+const RIBBON = [176, 226, 255];           // the long strip windows
+const BAYGLOW = [255, 170, 84];           // light inside a cargo bay
+const HAZARD = [236, 190, 40];
+const HAZARD_DARK = [34, 34, 38];
+const PAINT = [240, 104, 48];             // stencilled numbers
+const CRANE = [232, 172, 36];
+const RADIATOR = [255, 92, 36];          // heat glowing in the radiator fins
+const NOZZLE = [120, 180, 255];
+const SHIELD = [64, 156, 255];
+const PIRATE = [70, 62, 76];
+const PIRATE_RED = [214, 40, 44];
+const CARGO = [[186, 62, 44], [44, 104, 180], [58, 150, 92], [226, 180, 52], [222, 224, 226], [226, 118, 40], [128, 76, 160]];
+const LIVERY = [[232, 96, 44], [40, 168, 168], [232, 232, 236], [214, 60, 76]];
+
+// ---------- the planet's frame ----------
+// Camera axes: x right, y down, z toward the viewer. The camera rides along
+// with the station, always looking at the planet, so the sun and the stars
+// wheel slowly around the scene once per orbit.
+const OPEN = 26 * DEG;                    // how far the rings are tipped open toward us
+const ROLL = 9 * DEG;                   // and how far the whole system leans on screen
+const P = [Math.cos(OPEN) * Math.sin(ROLL), -Math.cos(OPEN) * Math.cos(ROLL), Math.sin(OPEN)];   // the pole
+const E1 = [Math.cos(ROLL), Math.sin(ROLL), 0];                                                  // two axes in the ring plane
+const E2 = cross(P, E1);
+const CAM_RATE = TAU / ORBIT;             // our own orbital rate; everything below is relative to it
+const OMEGA0 = 0.095;                     // orbital rate at one planet radius; falls off as r^-1.5
+const SPIN = 0.03;                        // how fast the cloud tops turn past us
+const SUN_EL = 14 * DEG;                  // the sun sits this far above the ring plane
+const PHASE0 = 150 * DEG;
+const RMIN = 1.2, RMAX = 3.0, RN = 900, RK = RN / (RMAX - RMIN);
+const NB = 13, NX = 28;
+
+let W = 0, H = 0, time = 0;
+const G = { cx: 0, cy: 0, Rp: 1 };
+const sun = [0, 0, 1];
+let sunVis = 1;                           // 0 while the station is in the planet's shadow
+
+function stepSun() {
+  const a = PHASE0 - CAM_RATE * time, ce = Math.cos(SUN_EL), se = Math.sin(SUN_EL);
+  for (let k = 0; k < 3; k++) sun[k] = ce * (Math.cos(a) * E1[k] + Math.sin(a) * E2[k]) + se * P[k];
+  sunVis = smooth(clamp((sun[2] + 0.72) / 0.16, 0, 1));
+}
+
+// ring profile: opacity and colour against radius
+const ringOp = new Float32Array(RN), ringR = new Float32Array(RN), ringG = new Float32Array(RN), ringB = new Float32Array(RN);
+// cloud belts: colour against latitude, and how fast each belt drifts
+const BT = new Uint8Array(256 * 3);
+const bandSpeed = new Float32Array(NB);
+const STORM_SL = 0.12;
+let stormBand = 0, storm0 = 0;
+
+function buildPlanet() {
+  const rnd = mulberry(SEED);
+  for (let i = 0; i < RN; i++) {
+    const r = RMIN + (i + 0.5) / RK;
+    ringOp[i] = 0;
+    RINGS.forEach((g, k) => {
+      if (r <= g[0] || r >= g[1]) return;
+      const edge = clamp(Math.min(r - g[0], g[1] - r) / 0.012, 0, 1);
+      let fine = 0.7 + 0.3 * noise1(r * 55, SEED + k);
+      if (noise1(r * 23, SEED + 40 + k) < 0.16) fine *= 0.6;         // thin gaps inside a ring
+      ringOp[i] = g[2] * edge * fine;
+      const tone = 0.86 + 0.14 * noise1(r * 31, SEED + 80 + k);
+      ringR[i] = g[3][0] * tone; ringG[i] = g[3][1] * tone; ringB[i] = g[3][2] * tone;
+    });
+  }
+  const cols = [];
+  let last = -1;
+  for (let j = 0; j <= NB; j++) {
+    let c;
+    do c = (rnd() * BANDS.length) | 0; while (c === last);
+    last = c;
+    cols.push(j === 0 || j === NB ? POLE : j === 1 || j === NB - 1 ? [84, 132, 168] : BANDS[c]);
+  }
+  for (let i = 0; i < 256; i++) {
+    const f = (i / 255) * NB + 0.5, c = Math.min(NB, f | 0), g = f - c;
+    let a = cols[c], b = a, t = 0;
+    if (g < 0.16 && c > 0) { b = cols[c - 1]; t = 0.5 - 0.5 * (g / 0.16); }
+    else if (g > 0.84 && c < NB) { b = cols[c + 1]; t = 0.5 * ((g - 0.84) / 0.16); }
+    for (let k = 0; k < 3; k++) BT[i * 3 + k] = lerp(a[k], b[k], t);
+  }
+  for (let j = 0; j < NB; j++) bandSpeed[j] = SPIN * (0.75 + 0.5 * rnd());
+  stormBand = Math.min(NB - 1, ((STORM_SL * 0.5 + 0.5) * NB) | 0);
+  storm0 = rnd() * TAU;
+}
+
+// ---------- stars ----------
+const stars = [];
+function buildStars() {
+  const rnd = mulberry(SEED + 5);
+  stars.length = 0;
+  for (let i = 0, n = Math.round((W * H) / 2300); i < n; i++)
+    stars.push({ x: rnd() * W, y: rnd() * H, b: 0.22 + 0.78 * Math.pow(rnd(), 2.6), ph: rnd() * TAU, f: 0.6 + 2.4 * rnd(), tint: rnd() });
+}
+function stepStars(dt) {
+  const v = (W / ORBIT) * 2.2;                                    // the far sky slides by as we go around
+  for (const s of stars) {
+    s.x -= E1[0] * v * dt; s.y -= E1[1] * v * dt;
+    if (s.x < 0) s.x += W; else if (s.x >= W) s.x -= W;
+    if (s.y < 0) s.y += H; else if (s.y >= H) s.y -= H;
+  }
+}
+
+// ---------- the depot ----------
+// A fixed three-quarter view, the kind where one step along the station is
+// three cells across and one down, so every edge is a clean staircase. The
+// station's x runs down to the right, y down to the left, z straight up, and
+// we only ever see the +x, +y and top faces of anything.
+//
+// Surfaces are sampled point by point into a depth buffer six times finer
+// than the cell grid. The concrete never moves, so it is sampled once and
+// kept; trucks, cranes and cargo are added on top every frame.
+const AMB = 0.12;
+const NRM = [[0.7071, 0.3536, 0.6124], [-0.7071, 0.3536, 0.6124], [0, -0.866, 0.5]];   // the three faces, in camera space
+const FACE_TONE = [0.34, 0.6, 0.92];      // right face, left face, top: the three never merge, wherever the sun is
+const lumF = [1, 1, 1];
+let gs = 1, OXc = 0, OYc = 0;             // scale, and where the station's origin sits (in cells)
+let SW = 0, SH = 0, stp = 0.1;
+let SZ, SCOL, SGL, SPR, SN;               // this frame
+let KZ, KCOL, KGL, KPR, KN;               // the kept, static station
+let BZ, BCOL, BGL, BPR, BN;               // whichever of the two is being written
+let mr = 0, mg = 0, mb = 0, mprio = 1, memit = false, mgl = 32;
+let mkeep = 0;                            // 8 while drawing things the red alert must not dim
+let epoch = -1;
+
+const EXT = { l: -58, r: 80, t: -28, b: 47 };   // how far the depot reaches from its origin, in steps
+function layoutStation(R) {
+  gs = clamp(Math.min((R.cols * 0.72) / (EXT.r - EXT.l), (R.rows - 4) / (EXT.b - EXT.t)), 0.4, 2.2);
+  OXc = Math.round(R.cols - 2 - EXT.r * gs);
+  OYc = Math.round(2 - EXT.t * gs + (R.rows - 4 - (EXT.b - EXT.t) * gs) / 2);
+  SW = R.cols * 2; SH = R.rows * 3; stp = 0.105 / gs;
+  const n = SW * SH;
+  SZ = new Float32Array(n); SCOL = new Uint32Array(n); SGL = new Uint16Array(n); SPR = new Uint8Array(n); SN = new Uint8Array(n);
+  KZ = new Float32Array(n); KCOL = new Uint32Array(n); KGL = new Uint16Array(n); KPR = new Uint8Array(n); KN = new Uint8Array(n);
+  epoch = -1;
+}
+// station coordinates to screen pixels
+const PT = [0, 0, 0];
+function project(x, y, z) {
+  PT[0] = (OXc + (x - y) * 3 * gs) * renderer.cw;
+  PT[1] = (OYc + (x + y) * gs - z * 2.5 * gs) * renderer.ch;
+  PT[2] = 0.6124 * (x + y) + 0.5 * z;
+  return PT;
+}
+function emit(x, y, z, n) {
+  const sx = (OXc + (x - y) * 3 * gs) * 2, sy = (OYc + (x + y) * gs - z * 2.5 * gs) * 3;
+  if (sx < 0 || sy < 0 || sx >= SW || sy >= SH) return;
+  const k = (sy | 0) * SW + (sx | 0), d = 0.6124 * (x + y) + 0.5 * z;
+  if (d <= BZ[k]) return;
+  BZ[k] = d; BCOL[k] = pack(mr, mg, mb); BGL[k] = mgl; BPR[k] = mprio; BN[k] = (memit ? 3 : n) | mkeep;
+}
+// A box, textured by `tex(face, u, v)`: face 0 is +x (u = y, v = z), face 1 is
+// +y (u = x, v = z), face 2 is the top (u = x, v = y), all in station coordinates.
+function gBox(x0, y0, z0, x1, y1, z1, tex) {
+  const s = stp, h = s / 2;
+  // walls catch a little extra light along their top edge, which keeps every block's outline crisp
+  const lip = z1 - Math.min(0.3, (z1 - z0) * 0.25) / gs;
+  const edge = () => { if (!memit) { mr *= 1.22; mg *= 1.22; mb *= 1.22; } };
+  for (let y = y0 + h; y < y1; y += s) for (let z = z0 + h; z < z1; z += s) { tex(0, y, z); if (z > lip) edge(); emit(x1, y, z, 0); }
+  for (let x = x0 + h; x < x1; x += s) for (let z = z0 + h; z < z1; z += s) { tex(1, x, z); if (z > lip) edge(); emit(x, y1, z, 1); }
+  for (let x = x0 + h; x < x1; x += s) for (let y = y0 + h; y < y1; y += s) { tex(2, x, y); emit(x, y, z1, 2); }
+}
+// an upright line too thin to have faces: a cable, a mast
+function gPole(x, y, z0, z1, col) {
+  mr = col[0]; mg = col[1]; mb = col[2]; mprio = 0; memit = false; mgl = 124;
+  for (let z = z0; z < z1; z += stp) emit(x, y, z, 1);
+}
+const set = (c, k, prio, gl, em) => { mr = c[0] * k; mg = c[1] * k; mb = c[2] * k; mprio = prio; mgl = gl; memit = em; };
+const flat = (c, k = 1) => (f) => set(c, f === 2 ? k * 1.04 : k, 1, 32, false);
+
+// --- concrete and what is cut into or painted on it ---
+function conc(tone, seed, over) {
+  return (f, u, v) => {
+    if (over) for (const o of over) if (o(f, u, v)) return;
+    const ph = f === 2 ? 2.5 : 1.25, pu = Math.floor(u / 2.5), pv = Math.floor(v / ph);
+    let k = tone * (0.95 + 0.08 * hash(pu, pv, seed + f * 7));      // each pour of the formwork a slightly different grey
+    const fu = u / 2.5 - pu, fv = v / ph - pv;
+    if (f !== 2) {
+      k *= 0.95 + 0.07 * noise1(u * 1.3 + seed, seed);              // weather streaks down the walls
+      if (fu < 0.045) return set(CONC, k * 0.74, 2, 124, false);   // the joint between pours
+      if (Math.abs(fu - 0.5) < 0.05 && Math.abs(fv - 0.5) < 0.1) return set(CONC, k, 2, 46, false);   // tie holes
+    } else if (fu < 0.04 || fv < 0.04) k *= 0.9;
+    set(CONC, k, 1, 32, false);
+  };
+}
+// rows of slit windows
+const slits = (face, u0, u1, v0, dv, rows, seed) => (f, u, v) => {
+  if (f !== face || u < u0 || u > u1) return false;
+  const r = Math.floor((v - v0) / dv);
+  if (r < 0 || r >= rows || v - v0 - r * dv > 0.42) return false;
+  const c = Math.floor(u);
+  if (u - c > 0.36) return false;
+  // each window is re-rolled every couple of minutes, not all at once
+  if (hash(c * 57 + r, Math.floor((epoch + hash(c, r, seed + 1) * 6) / 6), seed) < 0.5) set(WINDOW, 1, 3, 32, true);
+  else set(GLASS, 1, 3, 32, false);
+  return true;
+};
+// one long strip of glass with mullions
+const ribbon = (face, u0, u1, v0, v1) => (f, u, v) => {
+  if (f !== face || u < u0 || u > u1 || v < v0 || v > v1) return false;
+  if (u - Math.floor(u) < 0.12) set(GLASS, 0.7, 3, 32, false); else set(RIBBON, 0.82 + 0.18 * hash(Math.floor(u), face, 9), 3, 32, true);
+  return true;
+};
+// a cargo bay: a dark mouth in the wall with light coming up from inside
+const bay = (u0, u1, v0, v1) => (f, u, v) => {
+  if (f !== 1 || u < u0 - 0.3 || u > u1 + 0.3 || v < v0 || v > v1 + 0.3) return false;
+  if (u < u0 || u > u1 || v > v1) { set(HAZARD_DARK, 1.5, 3, 32, false); return true; }
+  const k = Math.pow(1 - (v - v0) / (v1 - v0), 1.5), rib = u - Math.floor(u / 2) * 2 < 0.16 ? 0.5 : 1;
+  set(BAYGLOW, (0.07 + 0.5 * k) * rib, 3, 32, true);
+  return true;
+};
+const DIGITS = ["111101101101111", "010110010010111", "111001111100111", "111001111001111", "101101111001001", "111100111001111", "111100111101111", "111001010010010", "111101111101111", "111101111001111"];
+// stencilled numbers; on a +x face the text has to run toward smaller u to read left to right
+const stencil = (face, text, u0, v0, tw, th) => (f, u, v) => {
+  if (f !== face) return false;
+  const cu = Math.floor((face === 0 ? u0 - u : u - u0) / tw), cv = Math.floor((v0 - v) / th);
+  if (cv < 0 || cv > 4 || cu < 0) return false;
+  const ch = Math.floor(cu / 4), col = cu - ch * 4;
+  if (ch >= text.length || col > 2) return false;
+  if (DIGITS[+text[ch]][cv * 3 + col] !== "1") return false;
+  set(PAINT, 0.9, 3, 32, true);                                    // lit signage, so it reads in shadow too
+  return true;
+};
+// the quay's deck: crane rails and a striped edge
+const quayDeck = (f, u, v) => {
+  if (f !== 2) return false;
+  if (v > QUAY_Y1 - 0.4) { if (Math.floor(u / 1.2) & 1) set(HAZARD, 0.95, 2, 32, false); else set(HAZARD_DARK, 1, 2, 32, false); return true; }
+  if (Math.abs(v - RAIL[0]) < 0.1 || Math.abs(v - RAIL[1]) < 0.1) { set(STEEL, 0.55, 2, 61, false); return true; }
+  return false;
+};
+
+// a radiator fin: a dark slab with rows of heat pipes glowing through it
+const radiator = (f, u, v) => {
+  if (f !== 1) return set(STEEL, 0.5, 1, 32, false);
+  const q = v / 1.7 - Math.floor(v / 1.7), su = Math.abs(u + 5) % 3.6;
+  if (q > 0.5 || su < 0.22) return set(STEEL, 0.34, 2, 32, false);       // the frame between the pipes
+  const heat = clamp((u + 8.8) / 7.6, 0, 1);                             // hottest where the coolant comes in
+  set(RADIATOR, 0.16 + 0.42 * heat * heat + 0.05 * noise1(u * 1.4, 17), 3, 32, true);
+};
+// the engine block's end: three square nozzles with a pilot glow deep inside
+const NOZ_Y = [3.3, 5.5, 7.7], NOZ_Z = -1.6;
+const nozzles = (f, u, v) => {
+  if (f !== 0) return false;
+  for (const y of NOZ_Y) {
+    const d = Math.max(Math.abs(u - y), Math.abs(v - NOZ_Z));
+    if (d > 0.85) continue;
+    if (d > 0.55) set(STEEL, 0.5, 3, 32, false); else set(NOZZLE, 0.16 + 0.5 * (1 - d / 0.55), 3, 32, true);
+    return true;
+  }
+  return false;
+};
+
+function buildStatic() {
+  BZ = KZ; BCOL = KCOL; BGL = KGL; BPR = KPR; BN = KN;
+  KZ.fill(-1e9);
+  // the keel hanging underneath
+  gBox(3, 1, -2, 23, 11, 0, conc(0.7, 3, [slits(1, 5, 21, -1.5, 1.2, 1, 71)]));
+  // more of the station hangs below it than a building ever could: a second
+  // tower pointing down, stepping in to a mast
+  gBox(12.5, 3, -6.5, 19.5, 9, -2, conc(0.84, 51, [slits(1, 13, 19, -5.9, 1.25, 3, 73), slits(0, 3.5, 8.5, -5.9, 1.25, 3, 75)]));
+  gBox(14.5, 4.5, -8, 17.5, 7.5, -6.5, conc(0.72, 53));
+  gPole(16, 6, -10, -8, STEEL);
+  gPole(5, 10.6, -4.2, -2, STEEL);
+  gPole(8.5, 10.6, -3.4, -2, STEEL);
+  // the engine block at the end of the keel
+  gBox(23, 2, -3.2, 26.6, 9, 0, conc(0.66, 55, [nozzles]));
+  // radiator fins out on a boom, well away from the crew
+  gBox(-9.4, 3.6, 3.3, 0, 4.3, 3.9, flat(STEEL, 0.6));
+  gBox(-8.8, 2.1, -0.6, -1.2, 2.45, 7.6, radiator);
+  gBox(-8.8, 5.5, -0.6, -1.2, 5.85, 7.6, radiator);
+  // the long back wall
+  gBox(0, -1.5, 0, 26, 0, 8.6, conc(0.8, 11));
+  // the main slab: cargo bays on the quay side, the depot's number on its end
+  gBox(0, 0, 0, 26, 8, 6.5, conc(1, 5, [
+    bay(1.6, 11, 1.5, 4.2), bay(15.1, 24.5, 1.5, 4.2),
+    stencil(1, "01", 4.4, 6.35, 0.5, 0.38), stencil(1, "02", 17.9, 6.35, 0.5, 0.38),
+    stencil(0, "07", 7.2, 5.6, 0.5, 0.75), slits(0, 0.6, 3, 1.4, 1.3, 4, 21),
+  ]));
+  // the quay
+  gBox(-1, 8, 0, 27, QUAY_Y1, 1.5, conc(0.88, 9, [quayDeck]));
+  // the tower, finned down its face
+  gBox(2.5, 0.8, 6.5, 9.5, 6.5, 12, conc(0.96, 13, [slits(0, 1.2, 6.2, 7.3, 1.2, 4, 31)]));
+  for (let k = 0; k < 7; k++) gBox(2.85 + k, 6.5, 6.8, 3.2 + k, 7.3, 11.7, conc(0.9, 40 + k));
+  gBox(4.5, 2.5, 12, 7, 5, 13, conc(0.72, 17));
+  gPole(8.5, 1.5, 12, 14.7, STEEL);
+  gPole(3.3, 5.6, 12, 13.4, STEEL);
+  // the middle block with its strip window
+  gBox(11.5, 0.5, 6.5, 19, 6, 9, conc(0.92, 19, [ribbon(1, 12, 18.5, 7.6, 8.25), slits(0, 1, 5.5, 7.2, 1.1, 1, 35)]));
+  // the control deck, hung out over the quay on one fat column
+  gBox(20.5, 4, 6.5, 23, 6.5, 9.6, conc(0.74, 23));
+  gBox(17, 3, 9.6, 25.5, 9.6, 11.4, conc(1.04, 25, [ribbon(1, 17.5, 25, 10.2, 10.85), ribbon(0, 3.5, 9.2, 10.2, 10.85)]));
+  gBox(19, 4.6, 11.4, 21.5, 7, 12.1, conc(0.74, 27));
+  gPole(24, 4, 11.4, 13.6, STEEL);
+  // a blunt block on the roof
+  gBox(22.8, 0.6, 6.5, 25.4, 3, 8, conc(0.82, 29));
+}
+
+// ---------- cargo, trucks and cranes ----------
+const NSLOT = 3, PITCH = 2.3, CL = 2.0, CWID = 1.1, CH = 1.1;      // truck slots, and the size of a container
+const QUAY_Y1 = 13.2, RAIL = [8.55, 12.55];
+const ENG = 1.8, CAB = 2.0, TW = 1.3;                              // a truck's engine block, cab and width
+const BERTH_X = [0.5, 14], BERTH_Y = 13.5, LANE = 16.6, TRUCK_Z = 1.0;
+const TRUCK_LEN = ENG + NSLOT * PITCH + 0.2 + CAB;
+const YCOLS = 4, YARD_Y = [9.6, 11.1], SAFE_Z = 5.4, BEAM_Z = 6.3;
+const rt = mulberry(SEED ^ 0x9e3779b9);
+const sparks = [];
+const trucks = [], cranes = [], yards = [];
+const yi = (c, r, l) => (c * 2 + r) * 2 + l;
+
+function loadTruck(t) {
+  t.livery = (rt() * LIVERY.length) | 0;
+  let n = 0;
+  for (let i = 0; i < NSLOT; i++) { t.slots[i] = rt() < 0.8 ? (rt() * CARGO.length) | 0 : -1; if (t.slots[i] >= 0) n++; }
+  if (!n) t.slots[1] = 0;
+}
+function buildWorld() {
+  trucks.length = cranes.length = yards.length = 0;
+  for (let b = 0; b < 2; b++) {
+    const t = { mode: b ? "away" : "docked", t: 0, dur: b ? 7 : 1, x: BERTH_X[b] - (b ? 80 : 0), y: b ? LANE : BERTH_Y, z: TRUCK_Z, slots: new Int8Array(NSLOT), livery: 0, phase: 0, toLoad: 0, keep: 6, burn: 0, acc: 0 };
+    loadTruck(t);
+    trucks.push(t);
+    const yd = new Int8Array(YCOLS * 4).fill(-1);
+    for (let c = 0; c < YCOLS; c++) for (let r = 0; r < 2; r++) {
+      if (rt() < 0.6) { yd[yi(c, r, 0)] = (rt() * CARGO.length) | 0; if (rt() < 0.3) yd[yi(c, r, 1)] = (rt() * CARGO.length) | 0; }
+    }
+    yards.push(yd);
+    cranes.push({ x: BERTH_X[b] + 5.5, y: 10.4, z: SAFE_Z, carry: -1, job: null, ph: 0, wait: 0, moving: false });
+  }
+}
+const slotX = (b, i) => BERTH_X[b] + ENG + 0.1 + i * PITCH + CL / 2;
+const stackN = (yd, c, r) => (yd[yi(c, r, 0)] < 0 ? 0 : yd[yi(c, r, 1)] < 0 ? 1 : 2);
+
+// what should this crane do next? null when the truck is finished with
+function nextJob(b) {
+  const t = trucks[b], yd = yards[b];
+  if (t.mode !== "docked" || t.t < 1) return null;
+  if (t.phase === 0) {                                             // take everything off
+    let i = -1;
+    for (let k = NSLOT - 1; k >= 0; k--) if (t.slots[k] >= 0) { i = k; break; }
+    if (i >= 0) {
+      let best = null, bs = 1e9;
+      for (let c = 0; c < YCOLS; c++) for (let r = 0; r < 2; r++) {
+        const n = stackN(yd, c, r);
+        if (n > 1) continue;
+        const sc = Math.abs(c - i) + n * 2.5 + r * 0.3;
+        if (sc < bs) { bs = sc; best = { c, r, l: n }; }
+      }
+      if (best) return { fromTruck: true, i, c: best.c, r: best.r, l: best.l };
+    }
+    let n = 0;
+    for (let k = 0; k < yd.length; k++) if (yd[k] >= 0) n++;
+    t.phase = 1; t.toLoad = clamp(n - t.keep, 0, NSLOT);
+  }
+  if (t.phase === 1) {                                             // then put the outbound cargo on
+    if (t.toLoad > 0) {
+      let i = -1;
+      for (let k = 0; k < NSLOT; k++) if (t.slots[k] < 0) { i = k; break; }
+      let best = null, bs = 1e9;
+      for (let c = 0; c < YCOLS; c++) for (let r = 0; r < 2; r++) {
+        const n = stackN(yd, c, r);
+        if (!n) continue;
+        const sc = Math.abs(c - i) - n * 2 + r * 0.3 + hash(c, r, t.livery + 3);
+        if (sc < bs) { bs = sc; best = { c, r, l: n - 1 }; }
+      }
+      if (i >= 0 && best) { t.toLoad--; return { fromTruck: false, i, c: best.c, r: best.r, l: best.l }; }
+    }
+    t.phase = 2;
+  }
+  return null;
+}
+const END = [0, 0, 0];
+function jobEnd(b, job, truck) {
+  if (truck) { END[0] = slotX(b, job.i); END[1] = BERTH_Y + TW / 2; END[2] = TRUCK_Z + 0.3 + CH; }
+  else { END[0] = slotX(b, job.c); END[1] = YARD_Y[job.r]; END[2] = 1.5 + (job.l + 1) * (CH + 0.02); }
+  return END;
+}
+function stepCrane(b, dt) {
+  const c = cranes[b], t = trucks[b], yd = yards[b];
+  const toward = (v, target, sp) => (Math.abs(target - v) <= sp * dt ? target : v + Math.sign(target - v) * sp * dt);
+  c.moving = false;
+  if (!c.job) {
+    c.job = nextJob(b);
+    c.ph = 0;
+    if (!c.job) {
+      if (t.mode === "docked" && t.phase === 2 && c.z >= SAFE_Z - 0.01) { t.mode = "out"; t.t = 0; t.dur = 4.5; }
+      const hx = BERTH_X[b] + 5.5;                                  // nothing to do: park
+      c.moving = c.x !== hx || c.z !== SAFE_Z;
+      c.z = toward(c.z, SAFE_Z, 2.4); c.x = toward(c.x, hx, 1.6); c.y = toward(c.y, 10.4, 1.6);
+      return;
+    }
+  }
+  const j = c.job, src = c.ph < 4;
+  const e = jobEnd(b, j, src ? j.fromTruck : !j.fromTruck), ex = e[0], ey = e[1], ez = e[2];
+  c.moving = true;
+  switch (c.ph) {
+    case 0: case 4: case 8:
+      c.z = toward(c.z, SAFE_Z, 2.6);
+      if (c.z === SAFE_Z) { if (c.ph === 8) c.job = null; else c.ph++; }
+      break;
+    case 1: case 5:
+      c.x = toward(c.x, ex, 2.8); c.y = toward(c.y, ey, 2.8);
+      if (c.x === ex && c.y === ey) c.ph++;
+      break;
+    case 2: case 6:
+      c.z = toward(c.z, ez, 2.2);
+      if (c.z === ez) { c.ph++; c.wait = 0.3; }
+      break;
+    case 3:
+      c.wait -= dt;
+      if (c.wait <= 0) {
+        if (j.fromTruck) { c.carry = t.slots[j.i]; t.slots[j.i] = -1; } else { c.carry = yd[yi(j.c, j.r, j.l)]; yd[yi(j.c, j.r, j.l)] = -1; }
+        c.ph = 4;
+      }
+      break;
+    case 7:
+      c.wait -= dt;
+      if (c.wait <= 0) {
+        if (j.fromTruck) yd[yi(j.c, j.r, j.l)] = c.carry; else t.slots[j.i] = c.carry;
+        c.carry = -1; c.ph = 8;
+      }
+      break;
+  }
+}
+
+function puff(x, y, z, dx, dy, dz, speed, hot) {
+  const p = project(x, y, z), cw = renderer.cw, ch = renderer.ch;
+  const jx = (Math.random() - 0.5) * 0.5, jy = (Math.random() - 0.5) * 0.5, jz = (Math.random() - 0.5) * 0.5;
+  const vx = dx + jx, vy = dy + jy, vz = dz + jz, sp = speed * (0.6 + 0.8 * Math.random());
+  sparks.push({
+    x: p[0], y: p[1], vx: (vx - vy) * 3 * gs * cw * sp, vy: ((vx + vy) * gs - vz * 2.5 * gs) * ch * sp,
+    t: 0, life: (hot ? 0.8 : 0.45) * (0.6 + 0.8 * Math.random()), hot,
+  });
+}
+function stepTruck(b, dt) {
+  const t = trucks[b], bx = BERTH_X[b];
+  t.t += dt;
+  const u = Math.min(1, t.t / t.dur);
+  t.burn = 0;
+  if (t.mode === "away") {
+    if (u >= 1) { loadTruck(t); t.mode = "arrive"; t.t = 0; t.dur = 16; }
+  } else if (t.mode === "arrive") {
+    t.x = bx - 72 * Math.pow(1 - u, 2.2); t.y = LANE;
+    if (u > 0.3 && u < 0.95 && Math.sin(t.t * 5) > 0.15) t.burn = 2;
+    if (u >= 1) { t.mode = "in"; t.t = 0; t.dur = 4.5; }
+  } else if (t.mode === "in") {
+    t.x = bx; t.y = lerp(LANE, BERTH_Y, smooth(u));
+    t.burn = u < 0.22 ? 3 : u > 0.78 ? 4 : 0;
+    if (u >= 1) { t.mode = "docked"; t.t = 0; t.dur = 1e9; t.phase = 0; t.keep = 3 + ((rt() * 6) | 0); }
+  } else if (t.mode === "docked") {
+    t.x = bx; t.y = BERTH_Y;
+  } else if (t.mode === "out") {
+    t.y = lerp(BERTH_Y, LANE, smooth(u));
+    t.burn = u < 0.22 ? 4 : u > 0.78 ? 3 : 0;
+    if (u >= 1) { t.mode = "depart"; t.t = 0; t.dur = 13; }
+  } else if (t.mode === "depart") {
+    t.x = bx + 88 * Math.pow(u, 2.2);
+    if (u < 0.85) t.burn = 1;
+    if (u >= 1) { t.mode = "away"; t.t = 0; t.dur = 7 + 14 * rt(); }
+  }
+  if (t.burn) {
+    t.acc += dt * (t.burn === 1 ? 60 : 26);
+    while (t.acc >= 1) {
+      t.acc -= 1;
+      const zc = t.z + 0.5, along = 0.5 + Math.random() * (TRUCK_LEN - 1);
+      if (t.burn === 1) puff(t.x - 0.1, t.y + 0.2 + Math.random() * (TW - 0.4), zc, -1, 0, 0, 3.2, true);
+      else if (t.burn === 2) puff(t.x + TRUCK_LEN + 0.1, t.y + TW / 2, zc, 1, 0, 0, 2.2, false);
+      else if (t.burn === 3) puff(t.x + along, t.y + TW + 0.05, zc, 0, 1, 0, 1.6, false);
+      else puff(t.x + along, t.y - 0.05, zc + 0.6, 0, -1, 0.4, 1.6, false);
+    }
+  }
+}
+// Every so often the engines fire for a couple of seconds to hold the orbit.
+const burn = { wait: 25, on: 0, acc: 0 };
+const BUOYS = [[-7, 17, 1.4], [-15, 17, 1.4], [-23, 17, 1.4], [30, 17, 1.4]];
+function stepBurn(dt) {
+  if (burn.on > 0) {
+    burn.on -= dt; burn.acc += dt * 70;
+    while (burn.acc >= 1) { burn.acc -= 1; puff(26.7, NOZ_Y[(Math.random() * 3) | 0] + (Math.random() - 0.5) * 0.6, NOZ_Z, 1, 0, 0, 3, true); }
+  } else if ((burn.wait -= dt) <= 0) { burn.on = 1.6 + rt() * 1.4; burn.wait = 35 + rt() * 50; }
+}
+// rotating alarm beacons: where they stand, and where each one's beam starts in its turn
+const ALARMS = [[9.5, 6.5, 12.2, 1], [27, 13.2, 1.7, 4.2]];
+const ALARM_PX = new Float32Array(ALARMS.length * 2);
+// ---------- pirates, the shield and the gun ----------
+// Raiders drop in off the quay side and open fire. Nothing gets through: the
+// station sits inside a shield nobody can see until a shot lands on it, when
+// that patch flares blue for a second. Meanwhile the gun on the control deck
+// swings round, charges for a few seconds and removes them one at a time.
+const SH_C = [13, 6, 2.5], SH_R = [24, 15.5, 14.5];                 // the shield: an egg around the whole depot
+const GUN = [20.25, 5.8, 13.85], BARREL = 3.4, CHARGE_TIME = 3.2, HIT_LIFE = 0.75;
+const raid = { alert: 0, spot: 0, wait: 18, pirates: [], bolts: [], hits: [], booms: [], target: null, charge: 0, beam: 0, beamTo: [0, 0, 0], aim: [0, 0.94, -0.34] };
+const muzzle = (out) => { for (let k = 0; k < 3; k++) out[k] = GUN[k] + raid.aim[k] * BARREL; return out; };
+const MZ = [0, 0, 0];
+
+// where a shot from p toward q meets the shield
+function shieldEntry(p, q, out) {
+  let A = 0, B = 0, C = -1;
+  for (let k = 0; k < 3; k++) { const d = (q[k] - p[k]) / SH_R[k], o = (p[k] - SH_C[k]) / SH_R[k]; A += d * d; B += 2 * o * d; C += o * o; }
+  const disc = B * B - 4 * A * C;
+  if (disc < 0) return false;
+  const t = (-B - Math.sqrt(disc)) / (2 * A);
+  if (t < 0 || t > 1) return false;
+  for (let k = 0; k < 3; k++) out[k] = p[k] + (q[k] - p[k]) * t;
+  return true;
+}
+function burst(x, y, z, n, speed, col, life) {
+  const p = project(x, y, z), px = p[0], py = p[1];
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * TAU, v = speed * (0.25 + Math.random()) * renderer.cw;
+    sparks.push({ x: px, y: py, vx: Math.cos(a) * v, vy: Math.sin(a) * v * 0.8, t: 0, life: life * (0.5 + Math.random()), hot: true, col });
+  }
+}
+function stepRaid(dt) {
+  const r = raid;
+  if (!r.pirates.length && !r.booms.length && r.beam <= 0) {
+    r.wait -= dt;
+    if (r.wait <= 0) {
+      const n = 1 + (rt() < 0.45 ? 1 : 0) + (rt() < 0.15 ? 1 : 0);
+      for (let i = 0; i < n; i++)
+        r.pirates.push({ x: 0, y: 70, z: 0, hx: 2 + rt() * 20, hy: 24 + rt() * 5, hz: rt() * 7, x0: -10 + rt() * 40, t: -i * 1.3, ph: rt() * TAU, cool: 0.6 + rt(), shots: 0 });
+      r.wait = 55 + 110 * rt();
+    }
+  }
+  for (let i = r.pirates.length - 1; i >= 0; i--) {
+    const p = r.pirates[i];
+    p.t += dt;
+    if (p.dead) {                                                  // on fire, engines out, sliding away for good
+      p.dt += dt;
+      p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
+      const q = project(p.x, p.y + 1.3, p.z + 0.5), qx = q[0], qy = q[1], cw = renderer.cw;
+      if (Math.random() < dt * 34) {                               // flame and smoke trailing behind it
+        const smoke = Math.random() < 0.3;
+        sparks.push({
+          x: qx + (Math.random() - 0.5) * 5 * cw, y: qy + (Math.random() - 0.5) * 3 * cw,
+          vx: (Math.random() - 0.5) * 5 * cw - (p.vx - p.vy) * 1.2 * cw, vy: -(1 + 3 * Math.random()) * cw - (p.vx + p.vy) * 0.4 * cw,
+          t: 0, life: (smoke ? 1.4 : 0.6) * (0.6 + 0.8 * Math.random()), hot: true, col: smoke ? [96, 90, 96] : Math.random() < 0.5 ? [255, 150, 40] : [255, 214, 110],
+        });
+      }
+      if (p.dt > 30 || qx < -120 || qy > H + 120 || qx > W + 120 || qy < -120) r.pirates.splice(i, 1);
+      continue;
+    }
+    const u = clamp(p.t / 4, 0, 1), e = 1 - Math.pow(1 - u, 2.6);
+    const sx = p.hx + 2.6 * Math.sin(p.t * 0.6 + p.ph), sz = p.hz + 0.8 * Math.sin(p.t * 0.9 + p.ph);
+    p.x = lerp(p.x0, sx, e); p.y = lerp(70, p.hy, e) + 0.5 * Math.sin(p.t * 0.7); p.z = sz;
+    if (u < 1) continue;
+    p.cool -= dt;
+    if (p.cool <= 0) {                                             // a few quick shots, then a breath
+      p.shots++;
+      p.cool = p.shots % 4 ? 0.16 + 0.12 * Math.random() : 0.9 + 0.8 * Math.random();
+      const from = [p.x + (p.shots & 1 ? 0.5 : -0.5), p.y - 0.2, p.z + 0.35];
+      const aim = [2 + Math.random() * 22, 8, 0.5 + Math.random() * 8], to = [0, 0, 0];
+      if (shieldEntry(from, aim, to)) r.bolts.push({ from, to, t: 0, dur: Math.hypot(to[0] - from[0], to[1] - from[1], to[2] - from[2]) / 34 });
+    }
+  }
+  for (let i = r.bolts.length - 1; i >= 0; i--) {
+    const b = r.bolts[i];
+    b.t += dt;
+    if (b.t >= b.dur) {
+      r.hits.push({ x: b.to[0], y: b.to[1], z: b.to[2], t: 0 });
+      r.bolts.splice(i, 1);
+    }
+  }
+  for (let i = r.hits.length - 1; i >= 0; i--) if ((r.hits[i].t += dt) > HIT_LIFE) r.hits.splice(i, 1);
+  for (let i = r.booms.length - 1; i >= 0; i--) if ((r.booms[i].t += dt) > 0.8) r.booms.splice(i, 1);
+  if (r.beam > 0) r.beam -= dt;
+  // red alert: up fast while anyone is still shooting, down slowly afterwards
+  const live = r.pirates.some((q) => !q.dead) || r.beam > 0;
+  r.alert = clamp(r.alert + (live ? 1.6 : -0.6) * dt, 0, 1);
+  r.spot += ((r.target ? r.charge : r.beam > 0 ? 1 : 0) - r.spot) * Math.min(1, dt * 5);   // the light on the gun swells as it charges
+  // the gun: pick whoever has been shooting longest, track, charge, fire
+  if (r.target && (r.target.dead || r.pirates.indexOf(r.target) < 0)) r.target = null;
+  if (!r.target) {
+    r.charge = 0;
+    for (const p of r.pirates) if (!p.dead && p.t > 5 && (!r.target || p.t > r.target.t)) r.target = p;
+  }
+  let ax = 0, ay = 0.94, az = -0.34;                               // at rest it points out over the quay
+  if (r.target) {
+    const t = r.target, l = Math.hypot(t.x - GUN[0], t.y - GUN[1], t.z - GUN[2]);
+    ax = (t.x - GUN[0]) / l; ay = (t.y - GUN[1]) / l; az = (t.z - GUN[2]) / l;
+  }
+  const k = Math.min(1, dt * 3);
+  r.aim[0] += (ax - r.aim[0]) * k; r.aim[1] += (ay - r.aim[1]) * k; r.aim[2] += (az - r.aim[2]) * k;
+  const al = Math.hypot(r.aim[0], r.aim[1], r.aim[2]);
+  r.aim[0] /= al; r.aim[1] /= al; r.aim[2] /= al;
+  if (r.target) {
+    r.charge += dt / CHARGE_TIME;
+    if (r.charge < 1 && Math.random() < dt * 30) {                 // motes drawn in toward the muzzle
+      const m = project(...muzzle(MZ)), a = Math.random() * TAU, d = (3 + 5 * Math.random()) * renderer.cw;
+      sparks.push({ x: m[0] + Math.cos(a) * d, y: m[1] + Math.sin(a) * d, vx: -Math.cos(a) * d / 0.3, vy: -Math.sin(a) * d / 0.3, t: 0, life: 0.3, hot: false, col: [150, 230, 255] });
+    }
+    if (r.charge >= 1) {
+      const t = r.target;
+      r.beam = 0.4; r.beamTo[0] = t.x; r.beamTo[1] = t.y + 1; r.beamTo[2] = t.z + 0.3;
+      r.booms.push({ x: t.x, y: t.y + 1, z: t.z + 0.3, t: 0 });
+      burst(t.x, t.y + 1, t.z + 0.3, 18, 11, [255, 190, 90], 0.7);
+      // it does not vanish: it is knocked away, burning
+      t.dead = true; t.dt = 0;
+      t.vx = (rt() - 0.5) * 1.6; t.vy = 1 + rt() * 0.9; t.vz = -0.25 + (rt() - 0.5) * 0.8;
+      r.target = null; r.charge = 0;
+    }
+  }
+}
+function stepDepot(dt) {
+  stepBurn(dt);
+  stepRaid(dt);
+  for (let b = 0; b < 2; b++) { stepTruck(b, dt); stepCrane(b, dt); }
+  for (let i = sparks.length - 1; i >= 0; i--) {
+    const p = sparks[i];
+    p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.t >= p.life) { sparks[i] = sparks[sparks.length - 1]; sparks.pop(); }
+  }
+}
+
+// a container: ribbed sides, a paler lid
+function gCargo(x, y, z, ci) {
+  const c = CARGO[ci];
+  gBox(x, y, z, x + CL, y + CWID, z + CH, (f, u) => {
+    if (f === 2) return set(c, 1.06, 1, 32, false);
+    const q = u * 3.2;
+    if (q - Math.floor(q) < 0.3) set(c, 0.8, 2, 124, false); else set(c, 1, 1, 32, false);
+  });
+}
+function gTruck(t) {
+  if (t.mode === "away") return;
+  const x = t.x, y = t.y, z = t.z, liv = LIVERY[t.livery];
+  // engine block, the spine the cargo rides on, and the cab
+  gBox(x, y, z, x + ENG, y + TW, z + 1.3, (f, u, v) => {
+    if (f !== 2 && v - z > 0.45 && v - z < 0.75) set(liv, 0.9, 2, 32, false); else set(STEEL, f === 2 ? 0.62 : 0.5, 1, 32, false);
+  });
+  const bx1 = x + ENG + NSLOT * PITCH + 0.2;
+  gBox(x + ENG, y + 0.3, z, bx1, y + TW - 0.3, z + 0.3, flat(STEEL, 0.42));
+  if (t.mode === "docked") {                                       // clamps reach out from the quay and hold it
+    gBox(x + 0.6, QUAY_Y1, z + 0.5, x + 1.1, y, z + 0.85, flat(HAZARD, 0.9));
+    gBox(bx1 + 0.7, QUAY_Y1, z + 0.5, bx1 + 1.2, y, z + 0.85, flat(HAZARD, 0.9));
+  }
+  for (let i = 0; i < NSLOT; i++) if (t.slots[i] >= 0) gCargo(x + ENG + 0.1 + i * PITCH, y + (TW - CWID) / 2, z + 0.3, t.slots[i]);
+  gBox(bx1, y, z, bx1 + CAB, y + TW, z + 1.55, (f, u, v) => {
+    const h = v - z;
+    if (f === 0 && h > 0.75 && h < 1.3 && u - y > 0.12 && u - y < TW - 0.12) return set(RIBBON, 0.9, 3, 32, true);     // windscreen
+    if (f === 1 && h > 0.75 && h < 1.3 && u - bx1 > 1.1 && u - bx1 < 1.85) return set(RIBBON, 0.75, 3, 32, true);      // side window
+    if (f !== 2 && h < 0.35) return set(STEEL, 0.45, 2, 32, false);
+    set(liv, f === 2 ? 1.05 : 1, 1, 32, false);
+  });
+}
+function gCrane(b) {
+  const c = cranes[b], x = c.x, paint = flat(CRANE);
+  gBox(x - 0.25, RAIL[0] - 0.22, 1.5, x + 0.25, RAIL[0] + 0.22, BEAM_Z, paint);
+  gBox(x - 0.25, RAIL[1] - 0.22, 1.5, x + 0.25, RAIL[1] + 0.22, BEAM_Z, paint);
+  gBox(x - 0.28, RAIL[0] - 0.4, BEAM_Z, x + 0.28, BERTH_Y + TW + 0.5, BEAM_Z + 0.5, paint);
+  gBox(x - 0.65, c.y - 0.6, BEAM_Z - 0.45, x + 0.65, c.y + 0.6, BEAM_Z, flat(STEEL, 0.55));
+  gPole(x - 0.6, c.y, c.z + 0.16, BEAM_Z - 0.45, STEEL);
+  gPole(x + 0.6, c.y, c.z + 0.16, BEAM_Z - 0.45, STEEL);
+  gBox(x - CL / 2 - 0.05, c.y - CWID / 2, c.z, x + CL / 2 + 0.05, c.y + CWID / 2, c.z + 0.16, flat(STEEL, 0.5));
+  if (c.carry >= 0) gCargo(x - CL / 2, c.y - CWID / 2, c.z - CH, c.carry);
+}
+// a raider, seen from behind: a blunt dark wedge with fins and a hot engine
+function gPirate(p) {
+  const x = p.x, y = p.y, z = p.z, dead = !!p.dead, fl = Math.floor(time * 9), dk = dead ? 0.55 : 1;
+  // once hit, flames lick over the hull in patches that keep changing
+  const fire = (f, u, v) => {
+    if (!dead || hash(Math.floor(u * 2.6) + f * 31, Math.floor(v * 2.6) + fl, 77 + (p.ph * 10 | 0)) > 0.42) return false;
+    set(hash(Math.floor(u * 2.6), fl, 5) < 0.4 ? [255, 226, 130] : [255, 128, 34], 1, 3, 32, true);
+    return true;
+  };
+  gBox(x - 0.65, y, z, x + 0.65, y + 2.6, z + 0.75, (f, u, v) => {
+    if (fire(f, u, v)) return;
+    if (!dead && f === 1 && Math.abs(u - x) < 0.42 && v - z > 0.15 && v - z < 0.6) return set(RADIATOR, 0.95, 3, 32, true);   // engine
+    if (!dead && f === 2 && v - y < 0.9 && Math.abs(u - x) < 0.3) return set(PIRATE_RED, 1, 3, 32, true);                     // canopy
+    if (f === 2 && Math.abs(v - y - 1.6) < 0.16) return set(PIRATE_RED, 0.9 * dk, 2, 32, false);
+    set(PIRATE, (f === 2 ? 1.1 : 1) * dk, 1, 32, false);
+  });
+  gBox(x - 1.9, y + 1.3, z + 0.2, x + 1.9, y + 2.4, z + 0.42, (f, u, v) => { if (!fire(f, u, v)) set(f === 1 ? PIRATE_RED : PIRATE, (f === 2 ? 1.15 : 0.9) * dk, 1, 32, false); });
+  gBox(x - 1.9, y + 1.6, z + 0.42, x - 1.6, y + 2.4, z + 1.25, flat(PIRATE, 1.05 * dk));
+  gBox(x + 1.6, y + 1.6, z + 0.42, x + 1.9, y + 2.4, z + 1.25, flat(PIRATE, 1.05 * dk));
+}
+// The defence gun: a white turret on a plinth above the control deck, with
+// two fat barrels that fill with light from breech to muzzle as it charges.
+function gBarrel(ox, oz) {
+  const d = raid.aim, ax = GUN[0] + ox, ay = GUN[1], az = GUN[2] + oz;
+  let ux = d[1], uy = -d[0], uz = 0;                                // two directions square to the barrel
+  const ul = Math.hypot(ux, uy) || 1; ux /= ul; uy /= ul;
+  const vx = d[1] * uz - d[2] * uy, vy = d[2] * ux - d[0] * uz, vz = d[0] * uy - d[1] * ux;
+  const n = Math.ceil(BARREL / stp), rad = 0.2;
+  for (let i = 0; i <= n; i++) {
+    const t = i / n, cx = ax + d[0] * BARREL * t, cy = ay + d[1] * BARREL * t, cz = az + d[2] * BARREL * t;
+    const lit = raid.target && t < raid.charge * 1.05, tip = t > 0.9, band = (t * 6) % 1 < 0.14;
+    for (let j = 0; j < 8; j++) {
+      const a = (j / 8) * TAU, c = Math.cos(a) * rad, sn = Math.sin(a) * rad, sh = 0.72 + 0.28 * Math.sin(a);
+      if (lit && !band) set([150, 232, 255], 0.75 + 0.25 * sh, 3, 32, true);
+      else set(tip || band ? STEEL : [214, 222, 236], (tip || band ? 0.5 : 0.95) * sh, 2, 32, true);
+      emit(cx + ux * c + vx * sn, cy + uy * c + vy * sn, cz + uz * c + vz * sn, 1);
+    }
+  }
+}
+function gGun() {
+  mkeep = 8;
+  gBox(GUN[0] - 1.25, GUN[1] - 1.25, 12.1, GUN[0] + 1.25, GUN[1] + 1.25, 12.55, (f, u, v) => {
+    if (f !== 2 && Math.floor((u + v) * 2.5) & 1) set(HAZARD, 1, 2, 32, false); else set(HAZARD_DARK, f === 2 ? 2 : 1.4, 1, 32, false);
+  });
+  gBox(GUN[0] - 0.6, GUN[1] - 0.6, 12.55, GUN[0] + 0.6, GUN[1] + 0.6, 13.3, flat(STEEL, 0.8));
+  gBox(GUN[0] - 0.95, GUN[1] - 0.95, 13.3, GUN[0] + 0.95, GUN[1] + 0.95, 14.35, (f, u, v) => {
+    if (f !== 2 && v > 13.65 && v < 13.95) set(PAINT, 1, 2, 32, false); else set([232, 234, 238], f === 2 ? 1.02 : 1, 1, 32, false);
+  });
+  gBarrel(-0.5, 0); gBarrel(0.5, 0);
+  mkeep = 0;
+}
+function buildMoving() {
+  BZ = SZ; BCOL = SCOL; BGL = SGL; BPR = SPR; BN = SN;
+  gGun();
+  mkeep = 8;
+  for (const p of raid.pirates) gPirate(p);
+  mkeep = 0;
+  for (const q of BUOYS) gBox(q[0], q[1], q[2], q[0] + 0.5, q[1] + 0.5, q[2] + 0.5, flat(HAZARD, 0.9));
+  for (let b = 0; b < 2; b++) {
+    const yd = yards[b];
+    for (let c = 0; c < YCOLS; c++) for (let r = 0; r < 2; r++) for (let l = 0; l < 2; l++) {
+      const ci = yd[yi(c, r, l)];
+      if (ci >= 0) gCargo(slotX(b, c) - CL / 2, YARD_Y[r] - CWID / 2, 1.5 + l * (CH + 0.02), ci);
+    }
+    gCrane(b);
+    gTruck(trucks[b]);
+  }
+}
+
+// ---------- drawing ----------
+const renderer = {
+  canvas: null, ctx: null, dpr: 1,
+  cw: 10, ch: 15, cols: 0, rows: 0, font: "monospace",
+  flag: new Uint8Array(0), glyph: new Uint16Array(0),
+  colour: new Uint32Array(0), fill: new Uint32Array(0),
+  act: new Int32Array(0),
+
+  resize(w, h, dpr) {
+    this.dpr = dpr;
+    this.cw = clamp(Math.round(w / 260), 4, 8);
+    this.ch = Math.round(this.cw * 1.5);
+    this.cols = Math.ceil(w / this.cw);
+    this.rows = Math.ceil(h / this.ch);
+    const n = this.cols * this.rows;
+    this.flag = new Uint8Array(n); this.glyph = new Uint16Array(n);
+    this.colour = new Uint32Array(n); this.fill = new Uint32Array(n);
+    this.canvas.width = Math.round(w * dpr);
+    this.canvas.height = Math.round(h * dpr);
+
+    const m = Math.min(w, h);
+    G.Rp = m * 0.43; G.cx = w * 0.2; G.cy = h * 0.7;
+    layoutStation(this);
+
+    // The camera never moves against the planet, so where each cell's line of
+    // sight meets the globe and the ring plane is worked out once, here.
+    const f32 = () => new Float32Array(n);
+    this.pcov = f32(); this.pnx = f32(); this.pny = f32(); this.pnz = f32(); this.psl = f32(); this.plon = f32();
+    this.rr0 = f32(); this.rr1 = f32(); this.rr2 = f32(); this.rth = f32();
+    this.rqx = f32(); this.rqy = f32(); this.rqz = f32(); this.rom = f32(); this.rk = f32();
+    this.rlane = new Int32Array(n); this.rdir = new Uint16Array(n);
+    const { cw, ch, cols, rows } = this, Rp = G.Rp, span = (cw + ch) / 2;
+    const laneW = cw * 1.3, alongW = cw * 2.2, act = [];
+    const ringR0 = (dx, dy) => { const z = -(dx * P[0] + dy * P[1]) / P[2]; return Math.sqrt(dx * dx + dy * dy + z * z); };
+    for (let r = 0; r < rows; r++)
+      for (let c = 0; c < cols; c++) {
+        const i = r * cols + c, dx = ((c + 0.5) * cw - G.cx) / Rp, dy = ((r + 0.5) * ch - G.cy) / Rp;
+        const d2 = dx * dx + dy * dy, d = Math.sqrt(d2);
+        const cov = clamp(((1 - d) * Rp) / span + 0.5, 0, 1);
+        let on = false, nz = 0;
+        if (cov > 0) {
+          let nx = dx, ny = dy;
+          if (d2 < 1) nz = Math.sqrt(1 - d2); else { nx /= d; ny /= d; }
+          this.pcov[i] = cov; this.pnx[i] = nx; this.pny[i] = ny; this.pnz[i] = nz;
+          this.psl[i] = nx * P[0] + ny * P[1] + nz * P[2];
+          this.plon[i] = Math.atan2(nx * E2[0] + ny * E2[1] + nz * E2[2], nx * E1[0] + ny * E1[1] + nz * E1[2]);
+          on = true;
+        }
+        const zr = -(dx * P[0] + dy * P[1]) / P[2], rc = Math.sqrt(d2 + zr * zr);
+        const oy = ch / 3 / Rp, ra = ringR0(dx, dy - oy), rb = ringR0(dx, dy + oy);
+        const inR = (v) => v > RMIN && v < RMAX;
+        if ((inR(rc) || inR(ra) || inR(rb)) && !(d2 < 1 && zr < nz)) {
+          this.rr0[i] = inR(ra) ? ra : 0; this.rr1[i] = rc; this.rr2[i] = inR(rb) ? rb : 0;
+          this.rqx[i] = dx; this.rqy[i] = dy; this.rqz[i] = zr;
+          const th = Math.atan2(dx * E2[0] + dy * E2[1] + zr * E2[2], dx * E1[0] + dy * E1[1] + zr * E1[2]);
+          this.rth[i] = th;
+          const lane = ((rc * Rp) / laneW) | 0, rl = ((lane + 0.5) * laneW) / Rp;
+          this.rlane[i] = lane;
+          this.rom[i] = OMEGA0 / (rl * Math.sqrt(rl)) - CAM_RATE;
+          this.rk[i] = (rl * Rp) / alongW;
+          // which way the ring runs across this cell
+          const tx = -Math.sin(th) * E1[0] + Math.cos(th) * E2[0], ty = -Math.sin(th) * E1[1] + Math.cos(th) * E2[1];
+          this.rdir[i] = dirGlyph(Math.atan2(ty * ch / cw, tx));
+          on = true;
+        }
+        if (on) act.push(i);
+      }
+    this.act = Int32Array.from(act);
+  },
+
+  cellIndex(x, y) {
+    const c = Math.floor(x / this.cw), r = Math.floor(y / this.ch);
+    return c < 0 || r < 0 || c >= this.cols || r >= this.rows ? -1 : r * this.cols + c;
+  },
+  bare(i, gl, col) {
+    if (!this.flag[i]) { this.flag[i] = 1; this.fill[i] = 0; }
+    this.glyph[i] = gl; this.colour[i] = col;
+  },
+
+  drawStars() {
+    for (const s of stars) {
+      const i = this.cellIndex(s.x, s.y);
+      if (i < 0) continue;
+      const b = s.b * (0.72 + 0.28 * Math.sin(time * s.f + s.ph));
+      const c = s.tint < 0.14 ? [255, 210, 168] : s.tint < 0.3 ? [168, 198, 255] : [222, 228, 242];
+      this.bare(i, s.b > 0.9 ? 42 : s.b > 0.72 ? 43 : 46, pack(c[0] * b, c[1] * b, c[2] * b));
+    }
+  },
+
+  drawPlanet() {
+    const { flag, glyph, colour, fill, act, pcov, pnx, pny, pnz, psl, plon, rr0, rr1, rr2, rth, rqx, rqy, rqz, rom, rk, rlane, rdir } = this;
+    const Lx = sun[0], Ly = sun[1], Lz = sun[2], Lp = Lx * P[0] + Ly * P[1] + Lz * P[2];
+    const stormLon = storm0 + time * bandSpeed[stormBand];
+    for (let a = 0; a < act.length; a++) {
+      const i = act[a], cov = pcov[i];
+      let solid = false, fr = 0, fg = 0, fb = 0, gl = 32, ink = 0.74, rim = 0, bright = false;
+      if (cov > 0) {
+        const nx = pnx[i], ny = pny[i], nz = pnz[i], sl = psl[i], lon = plon[i];
+        let lit = clamp((nx * Lx + ny * Ly + nz * Lz) * 1.5 + 0.1, 0, 1);
+        lit = lit * lit * (3 - 2 * lit);
+        if (lit > 0 && sl * Lp < 0) {                              // the rings' shadow across the cloud tops
+          const t = -sl / Lp, hx = nx + t * Lx, hy = ny + t * Ly, hz = nz + t * Lz, r = Math.sqrt(hx * hx + hy * hy + hz * hz);
+          if (r > RMIN && r < RMAX) lit *= 1 - 0.8 * ringOp[((r - RMIN) * RK) | 0];
+        }
+        // belts: each slides round at its own speed, with a churning edge
+        const f = (sl * 0.5 + 0.5) * NB;
+        let jb = f | 0; if (jb >= NB) jb = NB - 1;
+        const q = f - jb, u = (lon - time * bandSpeed[jb]) / TAU, x = (u - Math.floor(u)) * NX;
+        const wob = (pnoise(x, q * 2, NX, SEED + jb * 7) - 0.5) * Math.sin(Math.PI * q) * 1.7;
+        const ti = clamp(((f + wob) / NB * 255) | 0, 0, 255) * 3;
+        let br = BT[ti], bg = BT[ti + 1], bb = BT[ti + 2];
+        const th = hash((x * 5) | 0, (q * 3) | 0, 200 + jb);
+        let pg = th < 0.5 ? 32 : th < 0.76 ? 126 : th < 0.89 ? 45 : th < 0.96 ? 61 : 58;
+        const ds = sl - STORM_SL;
+        if (ds > -0.11 && ds < 0.11) {                             // the great storm
+          const dl = angleDiff(lon, stormLon) * Math.sqrt(1 - sl * sl), e = (dl / 0.27) * (dl / 0.27) + (ds / 0.1) * (ds / 0.1);
+          if (e < 1) {
+            const k = smooth(1 - e) * 0.92;
+            br = lerp(br, STORM[0], k); bg = lerp(bg, STORM[1], k); bb = lerp(bb, STORM[2], k);
+            pg = e < 0.08 ? 64 : e < 0.4 ? 79 : e < 0.75 ? 111 : 126;
+          }
+        }
+        const ld = 0.4 + 0.6 * nz, nk = 0.55 + 0.45 * nz;
+        let r = lerp(NIGHT[0] * nk, br * ld, lit), g = lerp(NIGHT[1] * nk, bg * ld, lit), b = lerp(NIGHT[2] * nk, bb * ld, lit);
+        const at = 1 - nz, a4 = at * at * at * lit * 0.55;
+        r = lerp(r, ATMOS[0], a4); g = lerp(g, ATMOS[1], a4); b = lerp(b, ATMOS[2], a4);
+        fr = r; fg = g; fb = b;
+        if (cov >= 0.5) { solid = true; gl = pg; }
+        else rim = cov < 0.22 ? 46 : 58;
+      }
+      const rc = rr1[i];
+      if (rc > 0) {
+        let op = 0, cr = 0, cg = 0, cb = 0;
+        for (let k = 0; k < 3; k++) {
+          const rs = k === 0 ? rr0[i] : k === 1 ? rc : rr2[i];
+          if (rs <= RMIN || rs >= RMAX) continue;
+          const j = ((rs - RMIN) * RK) | 0, o = ringOp[j];
+          op += o; cr += o * ringR[j]; cg += o * ringG[j]; cb += o * ringB[j];
+        }
+        if (op > 0.02) {
+          cr /= op; cg /= op; cb /= op; op /= 3;
+          // the planet's shadow lying across the rings
+          const bq = rqx[i] * Lx + rqy[i] * Ly + rqz[i] * Lz;
+          let sh = 0;
+          if (bq < 0) sh = smooth(1 - clamp((Math.sqrt(Math.max(0, rc * rc - bq * bq)) - 0.95) / 0.08, 0, 1));
+          const lane = rlane[i], light = (1 - 0.9 * sh) * (0.86 + 0.14 * hash(lane, 0, 3));
+          cr *= light; cg *= light; cb *= light;
+          // grains of ice streaming round, each lane at its own pace
+          const along = Math.floor((rth[i] - rom[i] * time) * rk[i]);
+          const h = hash(along, lane, 91);
+          const rgl = h < 0.52 ? 32 : h < 0.84 ? rdir[i] : h < 0.955 ? 46 : 42;
+          if (solid) {
+            fr = lerp(fr, cr, op); fg = lerp(fg, cg, op); fb = lerp(fb, cb, op);
+            if (op > 0.4) { gl = rgl; bright = rgl === 42 && sh < 0.5; }
+          } else if (op >= 0.3) {
+            const t = 0.25 + 0.75 * op;
+            solid = true; fr = lerp(BG[0], cr, t); fg = lerp(BG[1], cg, t); fb = lerp(BG[2], cb, t);
+            gl = rgl; bright = rgl === 42 && sh < 0.5;
+          } else if (hash(along, lane, 93) < op * 1.9) {
+            rim = h < 0.6 ? 46 : rdir[i]; fr = cr; fg = cg; fb = cb;
+          }
+        }
+      }
+      if (solid) {
+        flag[i] = 1; fill[i] = pack(fr, fg, fb); glyph[i] = gl;
+        colour[i] = bright ? pack(fr * 1.25 + 30, fg * 1.25 + 30, fb * 1.25 + 30) : pack(fr * ink, fg * ink, fb * ink);
+      } else if (rim) {
+        flag[i] = 1; fill[i] = 0; glyph[i] = rim; colour[i] = pack(fr, fg, fb);
+      }
+    }
+  },
+
+  drawMoons() {
+    const { cw, ch, cols, rows } = this, Rp = G.Rp, span = (cw + ch) / 2;
+    for (const m of MOONS) {
+      const th = m.th + (OMEGA0 / (m.r * Math.sqrt(m.r)) - CAM_RATE) * time, c = Math.cos(th) * m.r, s = Math.sin(th) * m.r;
+      const qx = c * E1[0] + s * E2[0], qy = c * E1[1] + s * E2[1], qz = c * E1[2] + s * E2[2];
+      const mx = G.cx + qx * Rp, my = G.cy + qy * Rp, rad = Math.max(m.size * Rp, span * 0.9);
+      if (mx < -rad || my < -rad || mx > W + rad || my > H + rad) continue;
+      // is it inside the planet's shadow?
+      const b = qx * sun[0] + qy * sun[1] + qz * sun[2];
+      const dark = b < 0 && m.r * m.r - b * b < 1 ? 0.1 : 1;
+      const c0 = Math.max(0, Math.floor((mx - rad) / cw) - 1), c1 = Math.min(cols - 1, Math.ceil((mx + rad) / cw) + 1);
+      const r0 = Math.max(0, Math.floor((my - rad) / ch) - 1), r1 = Math.min(rows - 1, Math.ceil((my + rad) / ch) + 1);
+      for (let r = r0; r <= r1; r++)
+        for (let cc = c0; cc <= c1; cc++) {
+          const i = r * cols + cc, dx = ((cc + 0.5) * cw - mx) / rad, dy = ((r + 0.5) * ch - my) / rad, d = Math.hypot(dx, dy);
+          const cov = clamp(((1 - d) * rad) / span + 0.5, 0, 1);
+          if (cov <= 0) continue;
+          if (this.pcov[i] >= 0.5 && qz < this.pnz[i]) continue;   // behind the planet
+          const nz = d < 1 ? Math.sqrt(1 - d * d) : 0;
+          const lit = AMB + dark * Math.max(0, dx * sun[0] + dy * sun[1] + nz * sun[2]);
+          const col = pack(m.col[0] * lit, m.col[1] * lit, m.col[2] * lit);
+          if (cov >= 0.5) {
+            this.flag[i] = 1; this.fill[i] = col;
+            this.glyph[i] = hash(cc, r, 60) < 0.3 ? 111 : 32;      // a crater or two
+            this.colour[i] = pack(m.col[0] * lit * 0.7, m.col[1] * lit * 0.7, m.col[2] * lit * 0.7);
+          } else this.bare(i, 46, col);
+        }
+    }
+  },
+
+  // turn the depth buffer into cells, lighting each face as it goes
+  resolve() {
+    const { cols, rows, flag, glyph, colour, fill, cw, ch } = this;
+    const al = raid.alert, gp = project(GUN[0], GUN[1], GUN[2] - 0.6), gcx = gp[0] / cw - 0.5, gcy = gp[1] / ch - 0.5;
+    const spotR = (34 + 95 * raid.spot) * gs, alarmR2 = Math.pow(125 * gs, 2);
+    if (al > 0) for (let q = 0; q < ALARMS.length; q++) { const a = project(ALARMS[q][0], ALARMS[q][1], ALARMS[q][2]); ALARM_PX[q * 2] = a[0]; ALARM_PX[q * 2 + 1] = a[1]; }
+    for (let r = 0; r < rows; r++)
+      for (let c = 0; c < cols; c++) {
+        const base = r * 3 * SW + c * 2;
+        let n = 0, zmax = -1e9;
+        for (let dj = 0; dj < 3; dj++)
+          for (let di = 0; di < 2; di++) {
+            const z = SZ[base + dj * SW + di];
+            if (z > -1e8) { n++; if (z > zmax) zmax = z; }
+          }
+        if (!n) continue;
+        let best = -1, bp = -1, bz = -1e9;
+        for (let dj = 0; dj < 3; dj++)
+          for (let di = 0; di < 2; di++) {
+            const k = base + dj * SW + di, z = SZ[k];
+            if (z < zmax - 0.3) continue;
+            const p = SPR[k];
+            if (p > bp || (p === bp && z > bz)) { best = k; bp = p; bz = z; }
+          }
+        const i = r * cols + c, col = SCOL[best], nf = SN[best] & 7;
+        let k = nf < 3 ? lumF[nf] : 1, red = 0;
+        if (al > 0) {
+          // On red alert the depot dims. The gun sits in a soft pool of light
+          // that swells as it charges, and each alarm beacon throws a turning
+          // beam of orange over whatever is near it.
+          const gd = Math.hypot((c - gcx) * cw, (r - gcy) * ch) / spotR, spot = Math.exp(-gd * gd);
+          if (SN[best] & 8) k *= 1 + 0.12 * al * spot;
+          else {
+            k *= lerp(1, lerp(nf === 3 ? 0.72 : 0.55, 1.15, spot), al);
+            let sum = 0;
+            for (let q = 0; q < ALARMS.length; q++) {
+              const dx = (c + 0.5) * cw - ALARM_PX[q * 2], dy = (r + 0.5) * ch - ALARM_PX[q * 2 + 1], dd = dx * dx + dy * dy;
+              if (dd >= alarmR2) continue;
+              const f = 1 - dd / alarmR2, a = time * 4.2 + ALARMS[q][3];
+              const lobe = dd < 9 ? 1 : (dx * Math.cos(a) + dy * Math.sin(a)) / Math.sqrt(dd);
+              sum += f * f * (0.22 + 0.78 * lobe * lobe * lobe * lobe);
+            }
+            red = al * Math.min(1, sum) * (1 - spot) * 95;
+          }
+        }
+        const cr = (col >>> 16) * k + red, cg = ((col >>> 8) & 255) * k + red * 0.42, cb = (col & 255) * k;
+        if (bp === 0) this.bare(i, SGL[best], pack(cr, cg, cb));
+        else if (n >= 3) {
+          const ink = nf === 3 ? 0.72 : 0.6;
+          flag[i] = 1; fill[i] = pack(cr, cg, cb); glyph[i] = SGL[best];
+          colour[i] = pack(cr * ink, cg * ink, cb * ink);
+        }
+      }
+  },
+
+  // a lamp somewhere on the depot, hidden when something is in front of it
+  lamp(x, y, z, col, on) {
+    if (!on) return;
+    const p = project(x, y, z), sx = (p[0] / this.cw * 2) | 0, sy = (p[1] / this.ch * 3) | 0;
+    if (p[0] < 0 || p[1] < 0 || sx >= SW || sy >= SH) return;
+    if (SZ[sy * SW + sx] > p[2] + 0.35) return;
+    const i = this.cellIndex(p[0], p[1]);
+    if (i < 0) return;
+    this.bare(i, 42, pack(col[0], col[1], col[2]));
+  },
+
+  drawDepot() {
+    const ep = Math.floor(time / 20);
+    if (ep !== epoch) { epoch = ep; buildStatic(); }                // a few windows change every so often
+    SZ.set(KZ); SCOL.set(KCOL); SGL.set(KGL); SPR.set(KPR); SN.set(KN);
+    buildMoving();
+    for (let k = 0; k < 3; k++) {
+      const d = NRM[k][0] * sun[0] + NRM[k][1] * sun[1] + NRM[k][2] * sun[2];
+      lumF[k] = (0.22 + 0.78 * sunVis) * (FACE_TONE[k] * 0.78 + (d > 0 ? d * 0.3 : 0));
+    }
+    this.resolve();
+    const t = time, RED = [255, 60, 52], AMBER = [255, 190, 80], WHITE = [255, 255, 255];
+    const alarm = raid.pirates.some((q) => !q.dead);                          // the mast beacons go frantic during a raid
+    this.lamp(8.5, 1.5, 14.8, RED, alarm ? t % 0.36 < 0.18 : t % 2 < 1);
+    this.lamp(3.3, 5.6, 13.5, RED, alarm ? (t + 0.18) % 0.36 < 0.18 : (t + 1) % 2 < 1);
+    this.lamp(16, 6, -10.1, RED, (t + 0.5) % 2 < 1);
+    if (raid.alert > 0.3) for (const q of ALARMS) this.lamp(q[0], q[1], q[2], [255, 170, 60], true);
+    this.lamp(5, 10.6, -4.3, AMBER, t % 3 < 0.3);
+    this.lamp(-9.4, 4, 4, RED, (t + 1.3) % 2 < 1);
+    // buoys along the approach lane wink in turn, leading trucks in
+    for (let k = 0; k < BUOYS.length; k++) this.lamp(BUOYS[k][0] + 0.25, BUOYS[k][1] + 0.25, BUOYS[k][2] + 0.6, [90, 255, 150], (t * 1.5 + k) % 3 < 0.5);
+    if (burn.on > 0) for (const y of NOZ_Y) this.lamp(26.65, y, NOZ_Z, [235, 245, 255], true);
+    this.lamp(24, 4, 13.7, WHITE, t % 2.4 < 0.1 || (t % 2.4 > 0.25 && t % 2.4 < 0.35));
+    for (let b = 0; b < 2; b++) {
+      const tr = trucks[b], c = cranes[b];
+      // lights run along the quay edge toward a berth that has a truck coming in
+      if (tr.mode === "arrive" || tr.mode === "in")
+        for (let k = 0; k < 7; k++) this.lamp(BERTH_X[b] + 0.4 + k * 1.7, QUAY_Y1 - 0.15, 1.55, AMBER, (k + Math.floor(t * 5)) % 7 < 2);
+      this.lamp(c.x, BERTH_Y + TW + 0.4, BEAM_Z + 0.55, AMBER, c.moving && t % 0.7 < 0.35);
+      if (tr.mode !== "away") {
+        this.lamp(tr.x + TRUCK_LEN - 0.6, tr.y + TW / 2, tr.z + 1.6, AMBER, tr.mode !== "docked" && t % 1 < 0.5);
+        this.lamp(tr.x + 0.2, tr.y + TW, tr.z + 1.35, RED, true);
+      }
+    }
+  },
+
+  // tint a cell toward a colour and optionally put a glyph on it
+  glow(i, col, k, gl, ink) {
+    const f = this.flag[i] && this.fill[i] ? this.fill[i] : pack(BG[0], BG[1], BG[2]);
+    this.flag[i] = 1;
+    this.fill[i] = pack(lerp(f >>> 16, col[0], k), lerp((f >>> 8) & 255, col[1], k), lerp(f & 255, col[2], k));
+    if (gl) { this.glyph[i] = gl; this.colour[i] = ink; } else if (this.glyph[i] === 0) this.glyph[i] = 32;
+  },
+  drawRaid() {
+    const { cw, ch, cols, rows } = this, r = raid;
+    // The shield, only where it has just been hit: a small bright patch and one
+    // thin ring running outward over the surface. Anything nearer to us than
+    // the shield at that spot (a raider, say) stays in front of it.
+    for (const h of r.hits) {
+      const p = project(h.x, h.y, h.z), c0 = Math.floor(p[0] / cw), r0 = Math.floor(p[1] / ch);
+      const RC = Math.ceil(13 * gs), RR = Math.ceil(9 * gs), u = h.t / HIT_LIFE, ring = 0.9 + 3.2 * Math.sqrt(u);
+      const fade = u < 0.5 ? 1 : u < 0.78 ? 0.6 : 0.3;                // stepped, so it switches off rather than smears
+      for (let rr = Math.max(0, r0 - RR); rr <= Math.min(rows - 1, r0 + RR); rr++)
+        for (let c = Math.max(0, c0 - RC); c <= Math.min(cols - 1, c0 + RC); c++) {
+          // where this cell's line of sight meets the shield, on the side facing us
+          const a = (c + 0.5 - OXc) / (3 * gs), b = (rr + 0.5 - OYc) / gs;
+          const ox = ((a + b) / 2 - SH_C[0]) / SH_R[0], oy = ((b - a) / 2 - SH_C[1]) / SH_R[1], oz = -SH_C[2] / SH_R[2];
+          const dx = 1 / SH_R[0], dy = 1 / SH_R[1], dz = 0.8 / SH_R[2];
+          const A = dx * dx + dy * dy + dz * dz, B = 2 * (ox * dx + oy * dy + oz * dz), C = ox * ox + oy * oy + oz * oz - 1;
+          const disc = B * B - 4 * A * C;
+          if (disc < 0) continue;
+          const s = (-B + Math.sqrt(disc)) / (2 * A), X = (a + b) / 2 + s, Y = (b - a) / 2 + s, Z = 0.8 * s;
+          const d = Math.hypot(X - h.x, Y - h.y, Z - h.z), core = d < 1.25 * (1 - u * 0.6), edge = Math.abs(d - ring) < 0.32;
+          if (!core && !edge) continue;
+          const k = (rr * 3 + 1) * SW + c * 2;
+          if (Math.max(SZ[k], SZ[k + 1]) > 0.6124 * (X + Y) + 0.5 * Z + 0.3) continue;
+          const i = rr * cols + c;
+          if (core) this.glow(i, d < 0.55 ? [200, 232, 255] : SHIELD, 0.85 * fade, 0, 0);
+          else this.glow(i, SHIELD, 0.5 * fade, 0, 0);
+        }
+    }
+    // shots in flight
+    for (const b of r.bolts) {
+      const pa = project(b.from[0], b.from[1], b.from[2]), ax = pa[0], ay = pa[1], pb = project(b.to[0], b.to[1], b.to[2]);
+      const gl = dirGlyph(Math.atan2(pb[1] - ay, pb[0] - ax));
+      for (let k = 0; k < 4; k++) {
+        const u = b.t / b.dur - k * 0.035;
+        if (u < 0) break;
+        const i = this.cellIndex(lerp(ax, pb[0], u), lerp(ay, pb[1], u));
+        if (i >= 0) this.bare(i, k ? gl : 42, k ? pack(255 - k * 40, 70, 50) : pack(255, 190, 150));
+      }
+    }
+    const m = project(...muzzle(MZ)), mx = m[0], my = m[1];
+    // the gun gathering its charge
+    if (r.target && r.charge > 0) {
+      const rad = (0.8 + 2.4 * r.charge) * cw * (0.9 + 0.1 * Math.sin(time * 40));
+      for (let y = my - rad; y <= my + rad; y += ch) for (let x = mx - rad * 1.2; x <= mx + rad * 1.2; x += cw) {
+        const d = Math.hypot((x - mx) / 1.2, y - my) / rad, i = this.cellIndex(x, y);
+        if (d < 1 && i >= 0) this.glow(i, [190, 240, 255], (1 - d) * (0.4 + 0.6 * r.charge), d < 0.35 ? 42 : 0, pack(255, 255, 255));
+      }
+    }
+    // and letting it go
+    if (r.beam > 0) {
+      const e = project(r.beamTo[0], r.beamTo[1], r.beamTo[2]), k = r.beam / 0.4, n = Math.ceil(Math.hypot(e[0] - mx, e[1] - my) / (cw * 0.5));
+      const gl = dirGlyph(Math.atan2(e[1] - my, e[0] - mx));
+      for (let j = 0; j <= n; j++) {
+        const x = lerp(mx, e[0], j / n), y = lerp(my, e[1], j / n), i = this.cellIndex(x, y);
+        if (i < 0) continue;
+        this.glow(i, [225, 248, 255], 0.3 + 0.7 * k, gl, pack(255, 255, 255));
+        const i2 = this.cellIndex(x, y + ch);
+        if (i2 >= 0 && k > 0.5) this.glow(i2, [120, 200, 255], 0.35 * k, 0, 0);
+      }
+    }
+    for (const b of r.booms) {
+      const p = project(b.x, b.y, b.z), px = p[0], py = p[1], u = b.t / 0.8, rad = (2 + 5 * Math.sqrt(u)) * cw;
+      for (let y = py - rad; y <= py + rad; y += ch) for (let x = px - rad; x <= px + rad; x += cw) {
+        const d = Math.hypot(x - px, y - py) / rad, i = this.cellIndex(x, y);
+        if (i < 0 || d > 1) continue;
+        if (u < 0.55 && d < 0.75) {                                  // the fireball: white at the heart, orange outside
+          const k = Math.min(1, (1 - d / 0.75) * 2.2) * (1 - u / 0.55), core = d < 0.3 + 0.2 * (1 - u);
+          this.glow(i, core ? [255, 244, 210] : [255, 132, 40], k, core ? 42 : hash(x | 0, y | 0, 5) < 0.4 ? 43 : 0, pack(255, 255, 230));
+        } else if (d > 0.82 && hash(x | 0, y | 0, 7) < 0.6) this.bare(i, d > 0.92 ? 46 : 43, pack(255 * (1 - u) + 60, 150 * (1 - u) + 30, 40));
+      }
+    }
+  },
+
+  drawSparks() {
+    for (const p of sparks) {
+      const i = this.cellIndex(p.x, p.y);
+      if (i < 0) continue;
+      const u = p.t / p.life, k = 1 - u * 0.75;
+      const col = p.col ? pack(p.col[0] * k, p.col[1] * k, p.col[2] * k) : p.hot ? pack(lerp(255, 110, u) * k, lerp(240, 160, u) * k, lerp(210, 255, u) * k) : pack(214 * k, 230 * k, 255 * k);
+      this.bare(i, u < 0.3 ? 42 : u < 0.65 ? 43 : 46, col);
+    }
+  },
+
+  render() {
+    const { ctx, dpr, cols, cw, ch } = this;
+    this.flag.fill(0);
+    this.drawStars();
+    this.drawPlanet();
+    this.drawMoons();
+    this.drawDepot();
+    this.drawRaid();
+    this.drawSparks();
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = `rgb(${BG})`;
+    ctx.fillRect(0, 0, W, H);
+
+    // one character per occupied cell
+    ctx.font = `600 ${Math.round(ch * 0.78)}px ${this.font}`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    let lastStyle = "";
+    for (let i = 0; i < this.flag.length; i++) {
+      if (!this.flag[i]) continue;
+      const x = (i % cols) * cw, y = ((i / cols) | 0) * ch;
+      if (this.fill[i]) {
+        const fs = css(this.fill[i]);
+        if (fs !== lastStyle) ctx.fillStyle = lastStyle = fs;
+        ctx.fillRect(x + 1, y + 1, cw - 1, ch - 1);
+      }
+      const g = this.glyph[i];
+      if (g === 32) continue;
+      const gs2 = css(this.colour[i]);
+      if (gs2 !== lastStyle) ctx.fillStyle = lastStyle = gs2;
+      ctx.fillText(String.fromCharCode(g), x + cw / 2, y + ch / 2 + ch * 0.06);
+    }
+  },
+};
+
+// ---------- boot ----------
+const canvas = document.querySelector("canvas");
+renderer.canvas = canvas;
+renderer.ctx = canvas.getContext("2d", { alpha: false });
+renderer.font = getComputedStyle(canvas).fontFamily || "monospace";
+buildPlanet();
+buildWorld();
+
+function tick(dt) {
+  time += dt;
+  stepSun();
+  stepStars(dt);
+  stepDepot(dt);
+}
+
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  if (w < 1 || h < 1) return;
+  W = w; H = h;
+  renderer.resize(w, h, Math.min(window.devicePixelRatio || 1, 2));
+  buildStars();
+  sparks.length = 0;
+  stepSun();
+  renderer.render();
+}
+
+// Frames drawn per second; override with ?fps=20 etc.
+const FPS = clamp(Number(params.get("fps")) || 30, 5, 120);
+const still = window.matchMedia("(prefers-reduced-motion: reduce)");
+let last = 0;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 1000 / FPS - 2) return;                         // not time for the next frame yet
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  tick(dt);
+  renderer.render();
+}
+
+window.addEventListener("resize", resize);
+resize();
+// ?t=20 starts the scene 20 seconds in
+for (let i = 0, n = Math.round((Number(params.get("t")) || 0) * 30); i < n; i++) tick(1 / 30);
+renderer.render();
+if (!still.matches) {
+  last = performance.now();
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
